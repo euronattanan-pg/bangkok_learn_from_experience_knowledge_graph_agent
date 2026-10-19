@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Enovia BOM Type Hierarchy — 80848205</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f4f6f9;
+      color: #1a1a2e;
+      padding: 32px 24px;
+    }
+    h1 { font-size: 1.8rem; font-weight: 700; color: #003087; margin-bottom: 4px; }
+    .subtitle { color: #666; font-size: 0.95rem; margin-bottom: 32px; }
+    h2 { font-size: 1.2rem; font-weight: 600; color: #003087; margin-bottom: 12px;
+         border-left: 4px solid #003087; padding-left: 10px; }
+
+    .section { background: white; border-radius: 12px; padding: 24px;
+               box-shadow: 0 2px 8px rgba(0,0,0,0.07); margin-bottom: 28px; }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      border-radius: 20px; padding: 4px 12px; font-size: 0.78rem; font-weight: 500;
+    }
+    .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+
+    .mermaid { display: flex; justify-content: center; padding: 8px 0; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    thead th {
+      background: #003087; color: white; padding: 10px 14px;
+      text-align: left; font-weight: 600;
+    }
+    tbody tr:nth-child(even) { background: #f0f4ff; }
+    tbody td { padding: 9px 14px; border-bottom: 1px solid #e5e7eb; vertical-align: top; }
+    .path { font-family: monospace; font-size: 0.82rem; }
+    .arrow { color: #888; margin: 0 4px; }
+    .badge {
+      display: inline-block; border-radius: 4px; padding: 2px 7px;
+      font-size: 0.72rem; font-weight: 600; white-space: nowrap;
+    }
+
+    pre.tree {
+      font-family: "Courier New", monospace;
+      font-size: 0.83rem;
+      line-height: 1.6;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      padding: 20px;
+      border-radius: 8px;
+      overflow-x: auto;
+    }
+  </style>
+</head>
+<body>
+
+<h1>📦 Enovia BOM — Type Hierarchy <span style="font-size:1rem;background:#fef9c3;color:#92400e;border-radius:4px;padding:2px 8px;margin-left:8px">single product · 80848205</span></h1>
+<p class="subtitle">
+  Product: OLD SPICE WILD COLLECTION AP INVISIBLE SOLID WOLFTHORN 2.6oz US 12CT (ID: 80848205)<br/>
+  Data source: FDM Production API · <code>GET /finishedproducts/mbom/{id}/available-materials</code>
+</p>
+
+<!-- ── LEGEND ── -->
+<div class="section">
+  <h2>Part Type Legend</h2>
+  <div class="legend">
+    <span class="pill" style="background:#f3eeff;color:#7c3aed">
+      <span class="dot" style="background:#7c3aed"></span>Finished Product Part
+    </span>
+    <span class="pill" style="background:#eff6ff;color:#1d4ed8">
+      <span class="dot" style="background:#1d4ed8"></span>pgCustomerUnitPart (CUP)
+    </span>
+    <span class="pill" style="background:#ecfdf5;color:#065f46">
+      <span class="dot" style="background:#065f46"></span>pgTransportUnitPart (TUP)
+    </span>
+    <span class="pill" style="background:#fefce8;color:#713f12">
+      <span class="dot" style="background:#713f12"></span>pgInnerPackUnitPart (IPP)
+    </span>
+    <span class="pill" style="background:#fff7ed;color:#c2410c">
+      <span class="dot" style="background:#c2410c"></span>pgConsumerUnitPart (COP)
+    </span>
+    <span class="pill" style="background:#f0fdf4;color:#166534">
+      <span class="dot" style="background:#166534"></span>pgMasterCustomerUnitPart (MCUP)
+    </span>
+    <span class="pill" style="background:#fff1f2;color:#be123c">
+      <span class="dot" style="background:#be123c"></span>Packaging Assembly Part (PAP)
+    </span>
+    <span class="pill" style="background:#fdf4ff;color:#86198f">
+      <span class="dot" style="background:#86198f"></span>Packaging Material Part (PMP)
+    </span>
+    <span class="pill" style="background:#fef9c3;color:#854d0e">
+      <span class="dot" style="background:#854d0e"></span>Formulation Part (FOP)
+    </span>
+    <span class="pill" style="background:#ecfeff;color:#0e7490">
+      <span class="dot" style="background:#0e7490"></span>pgOnlinePrintingPart (OPP)
+    </span>
+  </div>
+  <p style="font-size:0.85rem;color:#555">
+    <strong>Note:</strong> The same type can appear at multiple levels (e.g., Packaging Material Part appears under pgConsumerUnitPart, pgInnerPackUnitPart, pgCustomerUnitPart, and Packaging Assembly Part).
+    Nodes with isSubstitute=true are substitute materials, serving as alternatives under their parent node.
+  </p>
+</div>
+
+<!-- ── TYPE HIERARCHY DIAGRAM ── -->
+<div class="section">
+  <h2>Type Hierarchy Diagram</h2>
+  <div class="mermaid">
+flowchart TD
+    FPP(["<b>Finished Product Part</b><br/><small>80848205</small>"]):::fpp
+
+    CUP["<b>pgCustomerUnitPart</b><br/><small>CUP-00426199</small>"]:::cup
+    TUP["<b>pgTransportUnitPart</b><br/><small>TUP-00160485</small>"]:::tup
+
+    IPP["<b>pgInnerPackUnitPart</b><br/><small>IP-00057775</small>"]:::ipu
+    PMP_CUP["<b>Packaging Material Part</b><br/><small>CO P90X 2.25-3.4oz</small>"]:::pmp
+    OPP["<b>OPP</b><br/><small>21294210</small>"]:::opp
+
+    MCUP["<b>MCUP</b><br/><small>MCUP-00101160</small>"]:::mcup
+
+    COP["<b>pgConsumerUnitPart</b><br/><small>COP-00376364</small>"]:::cpu
+    PMP_IPU["<b>Packaging Material Part</b><br/><small>SWR MCG P90X 6CT</small>"]:::pmp
+
+    PAP["<b>Packaging Assembly Part</b><br/><small>91688293</small>"]:::pap
+    PMP_CPU1["<b>Packaging Material Part</b><br/><small>PSEAL WHT BF rPP</small><br/><i>★ has substitute</i>"]:::pmp
+    PMP_CPU2["<b>Packaging Material Part</b><br/><small>LBWR / CPST</small>"]:::pmp
+    FOP["<b>Formulation Part</b><br/><small>21316442</small>"]:::fm
+
+    PMP_PAP1["<b>Packaging Material Part</b><br/><small>BA / SCREW / ELEVATOR / CL</small>"]:::pmp
+    PMP_PAP2["<b>Packaging Material Part</b><br/><small>FSEAL CLPR SHP</small><br/><i>★ has substitute</i>"]:::pmp
+
+    PMP_SUB1["<b>Packaging Material Part</b><br/><small>PSEAL WHT BF XX</small><br/><i>isSubstitute = true</i>"]:::sub
+    PMP_SUB2["<b>Packaging Material Part</b><br/><small>FSEAL P90X NAT BF XX</small><br/><i>isSubstitute = true</i>"]:::sub
+
+    FPP --> CUP
+    FPP --> TUP
+
+    CUP --> IPP
+    CUP --> PMP_CUP
+    CUP --> OPP
+
+    TUP --> MCUP
+
+    IPP --> COP
+    IPP --> PMP_IPU
+
+    COP --> PAP
+    COP --> PMP_CPU1
+    COP --> PMP_CPU2
+    COP --> FOP
+
+    PAP --> PMP_PAP1
+    PAP --> PMP_PAP2
+
+    PMP_CPU1 -. "substitute" .-> PMP_SUB1
+    PMP_PAP2 -. "substitute" .-> PMP_SUB2
+
+    classDef fpp  fill:#7c3aed,color:#fff,stroke:none,rx:8
+    classDef cup  fill:#1d4ed8,color:#fff,stroke:none
+    classDef tup  fill:#065f46,color:#fff,stroke:none
+    classDef ipu  fill:#713f12,color:#fff,stroke:none
+    classDef cpu  fill:#c2410c,color:#fff,stroke:none
+    classDef mcup fill:#166534,color:#fff,stroke:none
+    classDef pap  fill:#be123c,color:#fff,stroke:none
+    classDef pmp  fill:#86198f,color:#fff,stroke:none
+    classDef fm   fill:#854d0e,color:#fff,stroke:none
+    classDef opp  fill:#0e7490,color:#fff,stroke:none
+    classDef sub  fill:#86198f,color:#fff,stroke:none,stroke-dasharray:5 3
+  </div>
+</div>
+
+<!-- ── BOM COMBINATIONS ── -->
+<div class="section">
+  <h2>BOM Combinations (Root-to-Leaf Type Paths)</h2>
+  <p style="font-size:0.85rem;color:#555;margin-bottom:14px">
+    Each row represents a complete path from <b>Finished Product Part</b> to a leaf node type.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>BOM Combination Path</th>
+        <th>Leaf Type</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td class="path">
+          <span style="color:#7c3aed">FPP</span>
+          <span class="arrow">→</span><span style="color:#1d4ed8">CUP</span>
+          <span class="arrow">→</span><span style="color:#713f12">IPP</span>
+          <span class="arrow">→</span><span style="color:#c2410c">COP</span>
+          <span class="arrow">→</span><span style="color:#be123c">PAP</span>
+          <span class="arrow">→</span><span style="color:#86198f">PMP</span>
+        </td>
+        <td><span class="badge" style="background:#fdf4ff;color:#86198f">Packaging Material Part</span></td>
+        <td>Raw packaging materials inside assembly (BA, SCREW, ELEVATOR, CL); FSEAL CLPR SHP with substitute</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td class="path">
+          <span style="color:#7c3aed">FPP</span>
+          <span class="arrow">→</span><span style="color:#1d4ed8">CUP</span>
+          <span class="arrow">→</span><span style="color:#713f12">IPP</span>
+          <span class="arrow">→</span><span style="color:#c2410c">COP</span>
+          <span class="arrow">→</span><span style="color:#86198f">PMP</span>
+        </td>
+        <td><span class="badge" style="background:#fdf4ff;color:#86198f">Packaging Material Part</span></td>
+        <td>Direct COP-level packaging materials (LBWR, CPST), incl. PSEAL WHT BF rPP with substitute</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td class="path">
+          <span style="color:#7c3aed">FPP</span>
+          <span class="arrow">→</span><span style="color:#1d4ed8">CUP</span>
+          <span class="arrow">→</span><span style="color:#713f12">IPP</span>
+          <span class="arrow">→</span><span style="color:#c2410c">COP</span>
+          <span class="arrow">→</span><span style="color:#854d0e">Formulation Part</span>
+        </td>
+        <td><span class="badge" style="background:#fef9c3;color:#854d0e">Formulation Part</span></td>
+        <td>Formulation (D10-12-2 w/2.50% Orng Born ZMPG 2022C FP) — <b>v1 comparison focus</b></td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td class="path">
+          <span style="color:#7c3aed">FPP</span>
+          <span class="arrow">→</span><span style="color:#1d4ed8">CUP</span>
+          <span class="arrow">→</span><span style="color:#713f12">IPP</span>
+          <span class="arrow">→</span><span style="color:#86198f">PMP</span>
+        </td>
+        <td><span class="badge" style="background:#fdf4ff;color:#86198f">Packaging Material Part</span></td>
+        <td>IPP-level packaging materials (SWR MCG 0.5oz PK39EC P90X 6ct — shrink wrap)</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td class="path">
+          <span style="color:#7c3aed">FPP</span>
+          <span class="arrow">→</span><span style="color:#1d4ed8">CUP</span>
+          <span class="arrow">→</span><span style="color:#86198f">PMP</span>
+        </td>
+        <td><span class="badge" style="background:#fdf4ff;color:#86198f">Packaging Material Part</span></td>
+        <td>CUP-level packaging materials (CO P90X 2.25-3.4oz — outer carton)</td>
+      </tr>
+      <tr>
+        <td>6</td>
+        <td class="path">
+          <span style="color:#7c3aed">FPP</span>
+          <span class="arrow">→</span><span style="color:#1d4ed8">CUP</span>
+          <span class="arrow">→</span><span style="color:#0e7490">pgOnlinePrintingPart</span>
+        </td>
+        <td><span class="badge" style="background:#ecfeff;color:#0e7490">pgOnlinePrintingPart</span></td>
+        <td>Online printing part (shipping marks / barcode labels)</td>
+      </tr>
+      <tr>
+        <td>7</td>
+        <td class="path">
+          <span style="color:#7c3aed">FPP</span>
+          <span class="arrow">→</span><span style="color:#065f46">TUP</span>
+          <span class="arrow">→</span><span style="color:#166534">MCUP</span>
+        </td>
+        <td><span class="badge" style="background:#f0fdf4;color:#166534">pgMasterCustomerUnitPart</span></td>
+        <td>Transport unit → master customer unit (pallet / slot dimension template)</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ── ASCII TREE ── -->
+<div class="section">
+  <h2>Full BOM Instance Tree</h2>
+  <p style="font-size:0.85rem;color:#555;margin-bottom:12px">
+    Brackets show identifier + revision. qty = quantity. ★ = isSubstitute.
+  </p>
+<pre class="tree">
+■ [Finished Product Part]  80848205 rev:001
+│  "OLD SPICE WILD COLLECTION AP IS WOLFTHORN 2.6oz US 12CT"
+│
+├── [pgCustomerUnitPart]  CUP-00426199 rev:001  qty:1
+│   │  "OS WC IS WOLFTHORN 2.6oz US 12ct"
+│   │
+│   ├── [pgInnerPackUnitPart]  IP-00057775 rev:001  qty:2
+│   │   │  "OS WC IS WOLFTHORN 2.6oz US 6ct"
+│   │   │
+│   │   ├── [pgConsumerUnitPart]  COP-00376364 rev:001  qty:6
+│   │   │   │  "OS WC IS WOLFTHORN 2.6oz US"
+│   │   │   │
+│   │   │   ├── [Packaging Assembly Part]  91688293 rev:003  qty:1
+│   │   │   │   │  "UNCS P90X MED GLBRED GLBRED 56.6mm"
+│   │   │   │   ├── [Packaging Material Part]  91622124 rev:005  qty:1  "BA P90X MEDIUM M4 GLB RED"
+│   │   │   │   ├── [Packaging Material Part]  91560326 rev:003  qty:1  "SCREW P90X MEDIUM M4 GLB RED"
+│   │   │   │   ├── [Packaging Material Part]  92277188 rev:003  qty:1  "ELEVATOR P90X NAT BF XX"
+│   │   │   │   ├── [Packaging Material Part]  91380156 rev:001  qty:1
+│   │   │   │   │   │  "FSEAL CLPR SHP P90X NAT"
+│   │   │   │   │   └── [Packaging Material Part]  99545329 rev:003  qty:1  ★substitute
+│   │   │   │   │       "FSEAL P90X NAT BF XX"
+│   │   │   │   └── [Packaging Material Part]  97057084 rev:007  qty:1  "CL P90X GLB RED"
+│   │   │   │
+│   │   │   ├── [Packaging Material Part]  90218837 rev:003  qty:1
+│   │   │   │   │  "PSEAL WHT BF rPP"
+│   │   │   │   └── [Packaging Material Part]  99958019 rev:006  qty:1  ★substitute
+│   │   │   │       "PSEAL WHT BF XX"
+│   │   │   │
+│   │   │   ├── [Packaging Material Part]  21312358 rev:001  qty:1  "LBWR OS WC IS WOLFTHORN 2.6oz US"
+│   │   │   ├── [Packaging Material Part]  21294206 rev:001  qty:1  "CPST OS WC IS 247 LST FRS LGD SNT FGT US"
+│   │   │   └── [Formulation Part]  21316442 rev:001  qty:0.08328
+│   │   │       "D10-12-2 w/2.50% Orng Born ZMPG 2022C FP"
+│   │   │
+│   │   └── [Packaging Material Part]  99829143 rev:006  qty:0.00275 KG
+│   │       "SWR MCG 0.5oz PK39EC P90X 6ct"
+│   │
+│   ├── [Packaging Material Part]  99903850 rev:004  qty:1
+│   │   "CO P90X 2.25-3.4oz US CA LA"
+│   │
+│   └── [pgOnlinePrintingPart]  21294210 rev:001  qty:1
+│       "80848205 OS WC IS WOLFTHORN 2.6oz US"
+│
+└── [pgTransportUnitPart]  TUP-00160485 rev:001  qty:1
+    │  "P90X MED LRG 36x7 U1"
+    └── [pgMasterCustomerUnitPart]  MCUP-00101160 rev:001  qty:252 mm
+        "P90X MED LRG 12ct 206X141X162mm NO PI"
+</pre>
+</div>
+
+<!-- ── SIMPLIFIED TYPE TREE ── -->
+<div class="section">
+  <h2>Deduplicated Type Tree</h2>
+  <p style="font-size:0.85rem;color:#555;margin-bottom:12px">
+    Same types merged; shows only inter-type structural relationships. Counts in parentheses indicate actual node occurrences.
+  </p>
+  <div class="mermaid">
+flowchart LR
+    A(["Finished\nProduct Part\n×1"]):::fpp
+
+    B["pgCustomer\nUnitPart\n×1"]:::cup
+    C["pgTransport\nUnitPart\n×1"]:::tup
+
+    D["pgInnerPack\nUnitPart\n×1"]:::ipu
+    E["Packaging\nMaterial Part\n×1 under CUP"]:::pmp
+    F["pgOnlinePrinting\nPart\n×1"]:::opp
+
+    G["pgMasterCustomer\nUnitPart\n×1"]:::mcup
+
+    H["pgConsumer\nUnitPart\n×1"]:::cpu
+    I["Packaging\nMaterial Part\n×1 under IPP"]:::pmp2
+
+    J["Packaging\nAssembly Part\n×1"]:::pap
+    K["Packaging\nMaterial Part\n×4+1sub under COP"]:::pmp3
+    L["Formulation\nPart\n×1"]:::fm
+
+    M["Packaging\nMaterial Part\n×5+1sub under PAP"]:::pmp4
+
+    A --> B
+    A --> C
+    B --> D
+    B --> E
+    B --> F
+    C --> G
+    D --> H
+    D --> I
+    H --> J
+    H --> K
+    H --> L
+    J --> M
+
+    classDef fpp  fill:#7c3aed,color:#fff,stroke:none
+    classDef cup  fill:#1d4ed8,color:#fff,stroke:none
+    classDef tup  fill:#065f46,color:#fff,stroke:none
+    classDef ipu  fill:#92400e,color:#fff,stroke:none
+    classDef cpu  fill:#c2410c,color:#fff,stroke:none
+    classDef mcup fill:#166534,color:#fff,stroke:none
+    classDef pap  fill:#be123c,color:#fff,stroke:none
+    classDef pmp  fill:#7e22ce,color:#fff,stroke:none
+    classDef pmp2 fill:#7e22ce,color:#fff,stroke:none
+    classDef pmp3 fill:#7e22ce,color:#fff,stroke:none
+    classDef pmp4 fill:#7e22ce,color:#fff,stroke:none
+    classDef fm   fill:#92400e,color:#fff,stroke:none
+    classDef opp  fill:#0e7490,color:#fff,stroke:none
+  </div>
+</div>
+
+<footer style="text-align:center;color:#999;font-size:0.78rem;margin-top:8px;padding-bottom:16px">
+  80848205 rev:001 · OLD SPICE WILD COLLECTION AP IS WOLFTHORN 2.6oz US 12CT · FDM Production API · gbo-apdo-bom-comparison<br/>
+  <a href="BOM_TYPE_HIERARCHY_v1.html" style="color:#3b82f6">→ v1 (80848203 Canyon)</a> ·
+  <a href="BOM_TYPE_HIERARCHY_v2.html" style="color:#3b82f6">→ v2 (45-product statistics)</a> ·
+  <a href="BOM_TYPE_HIERARCHY_v3.html" style="color:#3b82f6">→ v3 (6 Old Spice products)</a>
+</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: "neutral", flowchart: { useMaxWidth: false } });
+</script>
+</body>
+</html>
