@@ -34,3 +34,6 @@ coverage.xml
 
 # Local environment configuration and secrets
 .env*
+.env_dev
+!.env.example
+data/
