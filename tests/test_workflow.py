@@ -266,13 +266,17 @@ class WorkflowTests(unittest.TestCase):
             preview = self.store.graph_preview(case_id)
         self.assertEqual(preview["source"], "frozen_upload")
         self.assertEqual([x["name"] for x in preview["entries"] if x["label"] == "MachineComponent"], ["Chute"])
-        for error in (GraphSchemaError("Schema changed"), DuplicateTitleError("Title collision")):
+        for error in (GraphSchemaError("Schema changed"), DuplicateTitleError("Change the title and submit it for approval again.")):
             class RejectingRepository:
                 def write(self, graph):
                     raise error
             item = self.store.get(case_id)
-            with self.assertRaises(type(error)):
+            with self.assertRaises(type(error)) as rejected:
                 self.store.save(case_id, item["revision"], RejectingRepository())
+            if isinstance(error, DuplicateTitleError):
+                self.assertIn("stable case ID", str(rejected.exception))
+                self.assertIn("edits remain locked", str(rejected.exception))
+                self.assertNotIn("Change the title", str(rejected.exception))
             self.assertEqual(self.store.get(case_id)["status"], "upload_failed")
             with self.assertRaisesRegex(ValueError, "cannot be edited"):
                 self.update_case(case_id, {"title": "Changed"})

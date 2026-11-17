@@ -193,6 +193,8 @@ class Store:
         except DuplicateTitleError:
             target = "upload_failed" if item["status"] == "upload_failed" else "draft"
             self._finish_upload(case_id, item["revision"] + 1, target, "duplicate_title_rejected", "rejected")
+            if target == "upload_failed":
+                raise DuplicateTitleError("This upload has an uncertain outcome. Reconcile its stable case ID in Neo4j before retrying; edits remain locked.") from None
             raise
         except GraphSchemaError:
             self._finish_upload(case_id, item["revision"] + 1, item["status"], "upload_rejected_schema", "rejected")
