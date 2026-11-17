@@ -188,6 +188,48 @@ class FrontendTests(unittest.TestCase):
         self.page.wait_for_function("!mutationPending")
         self.assertIn("could not be refreshed", self.page.locator("#error").inner_text())
         self.assertTrue(self.page.locator("#save").is_disabled())
+        self.assertTrue(self.page.locator("#field-title").is_disabled())
+        self.assertTrue(self.page.locator("#update").is_disabled())
+        self.assertTrue(self.page.locator("#approve").is_disabled())
+        self.fail_refresh = False
+        self.page.locator("#tab-button-history").click()
+        self.page.locator("#history-list .case-row").filter(has_text="Case A").get_by_role("button").click()
+        self.page.wait_for_function("!mutationPending && draft.status === 'upload_failed'")
+        self.assertFalse(self.page.locator("#save").is_disabled())
+        self.assertTrue(self.page.locator("#field-title").is_disabled())
+
+    def test_same_case_review_save_preserves_unsaved_intake_transcript(self):
+        self.page.locator("#transcript").fill("Next interview not yet saved")
+        self.page.locator("#update").click()
+        self.page.wait_for_function("!mutationPending && draft.revision === 2")
+        self.assertEqual(self.page.locator("#transcript").input_value(), "Next interview not yet saved")
+
+    def test_connection_and_upload_overlap_restore_button_in_either_completion_order(self):
+        for check_first in (True, False):
+            with self.subTest(check_first=check_first):
+                self.cases["case-a"].update(status="approved", revision=1)
+                self.select_case("case-a")
+                self.page.evaluate("showTab('workspace')")
+                self.defer("/check")
+                self.page.locator("#check-connection").click()
+                self.page.evaluate("() => { window.finishCheck = window.finishRequest; }")
+                self.page.locator("#tab-button-upload").click()
+                self.defer("/save")
+                self.page.locator("#upload-list .primary").click()
+                self.page.evaluate("() => { window.finishUpload = window.finishRequest; }")
+                updated = dict(self.cases["case-a"], status="saved", revision=3)
+                if check_first:
+                    self.page.evaluate("window.finishCheck({message: 'Check complete'})")
+                    self.page.wait_for_function("document.getElementById('connection-status').textContent === 'Check complete'")
+                    self.assertTrue(self.page.locator("#check-connection").is_disabled())
+                    self.page.evaluate("item => window.finishUpload(item)", updated)
+                    self.page.wait_for_function("!mutationPending")
+                else:
+                    self.page.evaluate("item => window.finishUpload(item)", updated)
+                    self.page.wait_for_function("!mutationPending")
+                    self.assertTrue(self.page.locator("#check-connection").is_disabled())
+                    self.page.evaluate("window.finishCheck({message: 'Check complete'})")
+                self.page.wait_for_function("!document.getElementById('check-connection').disabled")
 
     def test_mutation_locks_typing_and_switching_and_restores_correct_controls(self):
         self.defer("/update")

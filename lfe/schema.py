@@ -248,7 +248,10 @@ def graph_mapping(case_id, answers, evidence):
 
 
 def graph_preview(case_id, answers, evidence):
-    graph = graph_mapping(case_id, answers, evidence)
+    return preview_graph(graph_mapping(case_id, answers, evidence))
+
+
+def preview_graph(graph):
     entries = []
     for node in graph["nodes"]:
         props = node["properties"]

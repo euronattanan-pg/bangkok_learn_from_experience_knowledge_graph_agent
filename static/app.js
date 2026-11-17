@@ -7,6 +7,7 @@ let mutationPending = false;
 let editGeneration = 0;
 let activeTab = "workspace";
 const disabledControls = new Map();
+const unverifiedCases = new Set();
 let connectionStatus = {configured: false, mock_uploads_allowed: false, message: "Configuration has not been checked."};
 const byId = id => document.getElementById(id);
 const tabNames = ["workspace", "drafts", "pending", "upload", "history", "audit"];
@@ -59,14 +60,18 @@ function applyWorkspace(updated, token) {
   if (draft !== token.selected || editGeneration !== token.generation) return false;
   draft = updated;
   editGeneration++;
+  unverifiedCases.delete(draft.id);
   localStorage.setItem("lfeDraft", draft.id);
-  byId("transcript").value = draft.transcript || "";
+  if (!token.selected || token.selected.id !== updated.id) {
+    byId("transcript").value = draft.transcript || "";
+  }
   render();
   return true;
 }
 
 function refreshWorkspace(updated, token) {
   if (!draft || draft.id !== updated.id || draft !== token.selected) return;
+  unverifiedCases.delete(updated.id);
   if (!applyWorkspace(updated, token)) {
     draft = updated;
     restoreControls();
@@ -121,6 +126,7 @@ async function showTab(name) {
 }
 
 function uploadUnavailable(item) {
+  if (unverifiedCases.has(item.id)) return "Upload status is unknown. Reopen this case before editing or retrying.";
   if (item.status === "writing") return "Upload is in progress.";
   if (item.is_sample && !connectionStatus.mock_uploads_allowed) {
     return "Mock uploads are disabled. Enable test-database mode only for a dedicated test database.";
@@ -143,7 +149,8 @@ async function showGraphPreview(target, item) {
   target.replaceChildren();
   const title = document.createElement("p");
   title.className = "upload-meta";
-  title.textContent = `Proposed mapping (not the current graph) for ${preview.case_name}. Review the separated names and source answers before approval or upload.`;
+  const source = preview.source === "frozen_upload" ? "Frozen upload snapshot" : "Proposed mapping (not the current graph)";
+  title.textContent = `${source} for ${preview.case_name}. Review the separated names and source answers before approval or upload.`;
   const list = document.createElement("ul");
   for (const entry of preview.entries) {
     const row = document.createElement("li");
@@ -392,13 +399,14 @@ function render() {
 }
 
 function renderControls() {
-  const locked = ["saved", "writing", "upload_failed", "upload_unverified"].includes(draft.status);
+  const unverified = unverifiedCases.has(draft.id);
+  const locked = unverified || ["saved", "writing", "upload_failed", "upload_unverified"].includes(draft.status);
   byId("fields").querySelectorAll("textarea, input, select").forEach(element => { element.disabled = locked; });
   byId("update").disabled = locked;
-  byId("preview-graph").disabled = !draft.id;
+  byId("preview-graph").disabled = !draft.id || unverified;
   byId("graph-preview").replaceChildren();
-  byId("submit").disabled = draft.status !== "draft" || !draft.id;
-  byId("approve").disabled = draft.status !== "pending" || !draft.id;
+  byId("submit").disabled = unverified || draft.status !== "draft" || !draft.id;
+  byId("approve").disabled = unverified || draft.status !== "pending" || !draft.id;
   const reason = uploadUnavailable(draft);
   byId("save").disabled = !["approved", "upload_failed"].includes(draft.status) || Boolean(reason);
   byId("upload-explanation").textContent = reason || (!["approved", "upload_failed"].includes(draft.status) ? "Submit and approve this case before uploading." : "");
@@ -446,10 +454,11 @@ async function uploadCase(item) {
       if (draft && draft.id === item.id) refreshWorkspace(updated, token);
     } catch (refreshError) {
       refreshFailed = true;
-      if (draft && draft.id === item.id && draft === token.selected) {
-        byId("save").disabled = true;
-        disabledControls.set(byId("save"), true);
-        byId("upload-explanation").textContent = "Upload status is unknown. Reload this case before retrying.";
+      unverifiedCases.add(item.id);
+      if (draft && draft.id === item.id) {
+        restoreControls();
+        renderControls();
+        lockControls();
       }
     }
     // Drop stale controls before refetching; a failed refresh must not leave a retry enabled.
@@ -535,7 +544,8 @@ byId("check-connection").addEventListener("click", async () => {
   } catch (error) {
     byId("connection-status").textContent = error.message;
   } finally {
-    button.disabled = false;
+    if (mutationPending) disabledControls.set(button, false);
+    button.disabled = mutationPending;
   }
 });
 run(() => mutate(async () => {

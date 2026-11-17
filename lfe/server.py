@@ -9,7 +9,7 @@ from .config import model_environment, neo4j_environment
 from .model import configured_adapter
 from .neo4j_repo import ConfigurationError, DatabaseOperationError, Neo4jRepository
 from .samples import samples
-from .schema import FIELDS, QUESTIONS, graph_preview
+from .schema import FIELDS, QUESTIONS
 from .store import Store
 from .workspace import WorkspaceLock, WorkspaceOwnershipError
 
@@ -69,12 +69,11 @@ def handler_for(store, repository, adapter):
             if path.startswith("/api/drafts/") and path.endswith("/graph-preview"):
                 case_id = path.removeprefix("/api/drafts/").removesuffix("/graph-preview")
                 try:
-                    item = store.get(case_id)
-                    result = graph_preview(case_id, item["answers"], item["evidence"])
-                    result["revision"] = item["revision"]
-                    return self.respond(200, result)
+                    return self.respond(200, store.graph_preview(case_id))
                 except ValueError as exc:
                     return self.respond(400, {"error": str(exc)})
+                except DatabaseOperationError as exc:
+                    return self.respond(503, {"error": str(exc)})
             if path.startswith("/api/drafts/"):
                 try:
                     return self.respond(200, store.get(path.removeprefix("/api/drafts/")))

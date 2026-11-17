@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .neo4j_repo import DuplicateTitleError, GraphSchemaError
-from .schema import graph_mapping, normalize_answers, normalize_evidence, normalized_name
+from .schema import graph_mapping, normalize_answers, normalize_evidence, normalized_name, preview_graph
 
 
 class Store:
@@ -109,6 +109,18 @@ class Store:
     def get(self, case_id):
         with self.connect() as db:
             return self.decode(db.execute("SELECT * FROM drafts WHERE id=?", (case_id,)).fetchone())
+
+    def graph_preview(self, case_id):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM drafts WHERE id=?", (case_id,)).fetchone()
+            item = self.decode(row)
+            frozen = item["status"] in ("writing", "upload_failed", "saved")
+            snapshot = row["upload_graph"] if frozen else None
+            if frozen and not snapshot:
+                raise GraphSchemaError("This older upload has no frozen preview. Reconcile its graph mapping before retrying.")
+            graph = json.loads(snapshot) if snapshot else graph_mapping(case_id, item["answers"], item["evidence"])
+        return {**preview_graph(graph), "revision": item["revision"],
+                "source": "frozen_upload" if snapshot else "current_mapper"}
 
     def record_rejection(self, case_id, action):
         with self.connect() as db:

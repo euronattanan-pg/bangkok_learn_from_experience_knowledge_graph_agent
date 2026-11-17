@@ -262,6 +262,10 @@ class WorkflowTests(unittest.TestCase):
                 raise DatabaseOperationError("Acknowledgement lost")
         with self.assertRaises(DatabaseOperationError):
             self.store.save(case_id, item["revision"], UncertainRepository())
+        with patch("lfe.store.graph_mapping", side_effect=AssertionError("Preview must use frozen graph")):
+            preview = self.store.graph_preview(case_id)
+        self.assertEqual(preview["source"], "frozen_upload")
+        self.assertEqual([x["name"] for x in preview["entries"] if x["label"] == "MachineComponent"], ["Chute"])
         for error in (GraphSchemaError("Schema changed"), DuplicateTitleError("Title collision")):
             class RejectingRepository:
                 def write(self, graph):
@@ -287,6 +291,8 @@ class WorkflowTests(unittest.TestCase):
             self.store.save(case_id, self.store.get(case_id)["revision"], self.repo)
         self.assertEqual(self.store.get(case_id)["status"], "upload_failed")
         self.assertEqual(self.repo.graphs, [])
+        with self.assertRaisesRegex(GraphSchemaError, "no frozen preview"):
+            self.store.graph_preview(case_id)
 
     def test_upload_completion_cannot_log_success_after_state_mismatch(self):
         case_id = self.item["id"]
@@ -820,6 +826,7 @@ class WorkflowTests(unittest.TestCase):
         with urllib.request.urlopen(request) as response:
             preview = json.load(response)
             self.assertEqual(preview["revision"], sample_draft["revision"])
+            self.assertEqual(preview["source"], "current_mapper")
             self.assertEqual([x["name"] for x in preview["entries"] if x["label"] == "MachineComponent"],
                              ["Chute", "Inner Guide", "Air Rejector"])
             self.assertTrue(all(x["machine_linked"] for x in preview["entries"]
