@@ -56,13 +56,13 @@ function workspaceToken() {
   return {selected: draft, generation: editGeneration};
 }
 
-function applyWorkspace(updated, token) {
+function applyWorkspace(updated, token, preserveTranscript = false) {
   if (draft !== token.selected || editGeneration !== token.generation) return false;
   draft = updated;
   editGeneration++;
   unverifiedCases.delete(draft.id);
   localStorage.setItem("lfeDraft", draft.id);
-  if (!token.selected || token.selected.id !== updated.id) {
+  if (!preserveTranscript && (!token.selected || token.selected.id !== updated.id)) {
     byId("transcript").value = draft.transcript || "";
   }
   render();
@@ -429,7 +429,7 @@ async function saveReview() {
   } else {
     updated = await request(`/api/drafts/${draft.id}/update`, {...values, revision: draft.revision});
   }
-  if (!applyWorkspace(updated, token)) {
+  if (!applyWorkspace(updated, token, true)) {
     if (draft === token.selected) {
       // Advance the server baseline without replacing input entered after this save.
       draft = updated;

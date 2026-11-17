@@ -204,6 +204,18 @@ class FrontendTests(unittest.TestCase):
         self.page.wait_for_function("!mutationPending && draft.revision === 2")
         self.assertEqual(self.page.locator("#transcript").input_value(), "Next interview not yet saved")
 
+    def test_first_mock_review_save_preserves_unsaved_intake_transcript(self):
+        self.cases["unsaved-mock"] = dict(self.cases["case-a"], id=None, is_sample=True)
+        self.select_case("unsaved-mock")
+        self.page.locator("#transcript").fill("Next interview not yet saved")
+        self.defer("/api/sample-drafts")
+        self.page.locator("#update").click()
+        persisted = dict(self.cases["unsaved-mock"], id="new-mock-case", revision=1)
+        self.page.evaluate("item => window.finishRequest(item)", persisted)
+        self.page.wait_for_function("!mutationPending && draft.id === 'new-mock-case'")
+        self.assertEqual(self.page.locator("#transcript").input_value(), "Next interview not yet saved")
+        self.assertEqual(self.page.evaluate("localStorage.getItem('lfeDraft')"), "new-mock-case")
+
     def test_connection_and_upload_overlap_restore_button_in_either_completion_order(self):
         for check_first in (True, False):
             with self.subTest(check_first=check_first):
