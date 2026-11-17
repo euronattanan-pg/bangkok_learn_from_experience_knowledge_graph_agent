@@ -2,6 +2,8 @@ import json
 import sqlite3
 import tempfile
 import threading
+import subprocess
+import sys
 import unittest
 import urllib.error
 import urllib.request
@@ -11,14 +13,16 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from lfe.config import neo4j_environment
-from lfe.model import ManualAdapter
+from lfe.config import model_environment, neo4j_environment
+from lfe.model import ManualAdapter, configured_adapter
 from lfe.neo4j_repo import (ConfigurationError, DatabaseOperationError, DuplicateTitleError, GraphSchemaError,
                             Neo4jRepository, REQUIRED_CONSTRAINTS, REQUIRED_RELATIONSHIP_CONSTRAINTS)
+from lfe.neo4j_repo import graph_fingerprint
 from lfe.samples import samples
 from lfe.schema import FIELDS, QUESTIONS, display_name, graph_mapping, normalize_answers
 from lfe.server import handler_for
 from lfe.store import Store
+from lfe.workspace import WorkspaceLock, WorkspaceOwnershipError
 
 
 class FakeRepository:
@@ -197,12 +201,180 @@ class WorkflowTests(unittest.TestCase):
         self.approve_case(case_id)
         with self.store.connect() as db:
             db.execute("UPDATE drafts SET status='writing' WHERE id=?", (case_id,))
-        reopened = Store(self.store.path)
+        self.assertEqual(Store(self.store.path).get(case_id)["status"], "writing")
+        with WorkspaceLock(self.store.path) as owner:
+            reopened = Store(self.store.path, owner=owner)
         item = reopened.get(case_id)
         self.assertEqual(item["status"], "upload_failed")
         self.assertEqual(reopened.audit()[0]["action"], "upload_interrupted")
         with self.assertRaises(ValueError):
             reopened.update(case_id, {"title": "Changed"}, {}, item["revision"])
+
+    def test_exclusive_workspace_ownership_blocks_second_process_during_upload(self):
+        case_id = self.item["id"]
+        self.update_case(case_id, {"title": "Live upload"})
+        item = self.approve_case(case_id)
+        entered, release = threading.Event(), threading.Event()
+        failures = []
+        class SlowRepository:
+            def write(self, graph):
+                entered.set()
+                if not release.wait(10):
+                    raise RuntimeError("Test upload timed out")
+        def upload():
+            try:
+                self.store.save(case_id, item["revision"], SlowRepository())
+            except Exception as exc:
+                failures.append(exc)
+        with WorkspaceLock(self.store.path) as owner:
+            thread = threading.Thread(target=upload)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(Store(self.store.path).get(case_id)["status"], "writing")
+                with self.assertRaises(WorkspaceOwnershipError):
+                    with WorkspaceLock(self.store.path):
+                        self.fail("A second owner must not be admitted")
+                script = ("from lfe.workspace import WorkspaceLock, WorkspaceOwnershipError\n"
+                          "import sys\ntry:\n with WorkspaceLock(sys.argv[1]): pass\n"
+                          "except WorkspaceOwnershipError:\n sys.exit(7)\n")
+                result = subprocess.run([sys.executable, "-c", script, self.store.path],
+                                        capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 7)
+                self.assertEqual(self.store.get(case_id)["status"], "writing")
+            finally:
+                release.set()
+                thread.join(10)
+        self.assertEqual(failures, [])
+        self.assertEqual(self.store.get(case_id)["status"], "saved")
+        self.assertNotIn("upload_interrupted", [e["action"] for e in self.store.audit()])
+        with WorkspaceLock(self.store.path) as owner:
+            Store(self.store.path, owner=owner)
+        with self.assertRaises(WorkspaceOwnershipError):
+            self.store.recover_interrupted(owner)
+
+    def test_retry_rejections_preserve_uncertain_snapshot_and_lock(self):
+        case_id = self.item["id"]
+        self.update_case(case_id, {"title": "Uncertain", "component": "Chute"})
+        item = self.approve_case(case_id)
+        class UncertainRepository:
+            def write(self, graph):
+                raise DatabaseOperationError("Acknowledgement lost")
+        with self.assertRaises(DatabaseOperationError):
+            self.store.save(case_id, item["revision"], UncertainRepository())
+        for error in (GraphSchemaError("Schema changed"), DuplicateTitleError("Title collision")):
+            class RejectingRepository:
+                def write(self, graph):
+                    raise error
+            item = self.store.get(case_id)
+            with self.assertRaises(type(error)):
+                self.store.save(case_id, item["revision"], RejectingRepository())
+            self.assertEqual(self.store.get(case_id)["status"], "upload_failed")
+            with self.assertRaisesRegex(ValueError, "cannot be edited"):
+                self.update_case(case_id, {"title": "Changed"})
+        with patch("lfe.store.graph_mapping", side_effect=AssertionError("Must reuse frozen graph")):
+            item = self.store.save(case_id, self.store.get(case_id)["revision"], self.repo)
+        self.assertEqual(item["status"], "saved")
+        self.assertEqual(self.repo.graphs[0]["case"]["title"], "Uncertain")
+
+    def test_legacy_uncertain_upload_requires_manual_reconciliation(self):
+        case_id = self.item["id"]
+        self.update_case(case_id, {"title": "Legacy unknown"})
+        self.approve_case(case_id)
+        with self.store.connect() as db:
+            db.execute("UPDATE drafts SET status='upload_failed' WHERE id=?", (case_id,))
+        with self.assertRaisesRegex(GraphSchemaError, "no frozen snapshot"):
+            self.store.save(case_id, self.store.get(case_id)["revision"], self.repo)
+        self.assertEqual(self.store.get(case_id)["status"], "upload_failed")
+        self.assertEqual(self.repo.graphs, [])
+
+    def test_upload_completion_cannot_log_success_after_state_mismatch(self):
+        case_id = self.item["id"]
+        self.update_case(case_id, {"title": "CAS guard"})
+        item = self.approve_case(case_id)
+        store = self.store
+        class ChangedRepository:
+            def write(self, graph):
+                with store.connect() as db:
+                    db.execute("UPDATE drafts SET revision=revision+1 WHERE id=?", (case_id,))
+        with self.assertRaisesRegex(RuntimeError, "state changed"):
+            self.store.save(case_id, item["revision"], ChangedRepository())
+        self.assertNotIn("upload_completed", [e["action"] for e in self.store.audit()])
+        self.assertEqual(self.store.get(case_id)["status"], "writing")
+
+    def test_saved_draft_list_survives_restart_and_includes_returned_drafts(self):
+        first = self.update_case(self.item["id"], {"title": "First draft"})
+        second = self.store.create("", {"answers": {"title": "Second draft"}, "evidence": {}})
+        self.approve_case(first["id"])
+        self.update_case(first["id"], {"title": "Returned draft"})
+        reopened = Store(self.store.path)
+        self.assertEqual({x["id"] for x in reopened.drafts()}, {first["id"], second["id"]})
+        self.assertEqual(reopened.get(second["id"])["answers"]["title"], "Second draft")
+
+    def test_matching_committed_snapshot_reconciles_without_graph_writes(self):
+        graph = graph_mapping(str(uuid.uuid4()), {"title": "Committed"}, {})
+        tx = MagicMock()
+        tx.run.return_value.single.return_value = {"fingerprint": graph_fingerprint(graph)}
+        Neo4jRepository._write_transaction(tx, graph)
+        self.assertEqual(tx.run.call_count, 1)
+        self.assertIn("RETURN c.upload_fingerprint", tx.run.call_args.args[0])
+        for fingerprint in ("different", None):
+            tx.reset_mock()
+            tx.run.return_value.single.return_value = {"fingerprint": fingerprint}
+            with self.assertRaisesRegex(GraphSchemaError, "unverified snapshot"):
+                Neo4jRepository._write_transaction(tx, graph)
+            self.assertEqual(tx.run.call_count, 1)
+
+    def test_lost_commit_acknowledgement_reconciles_frozen_case_after_restart(self):
+        case_id = self.item["id"]
+        self.update_case(case_id, {"title": "Commit acknowledgement"})
+        item = self.approve_case(case_id)
+        persisted = {}
+        tx = MagicMock()
+        def run(query, **params):
+            result = MagicMock()
+            if "RETURN c.upload_fingerprint" in query:
+                result.single.return_value = persisted.get(params["id"])
+            elif "count(c)" in query:
+                result.single.return_value = {"count": 0}
+            elif query.startswith("CREATE (c:LFECase"):
+                persisted[params["id"]] = {"fingerprint": params["props"]["upload_fingerprint"]}
+            return result
+        tx.run.side_effect = run
+        class AcknowledgementRepository:
+            lose_ack = True
+            def write(self, graph):
+                Neo4jRepository._write_transaction(tx, graph)
+                if self.lose_ack:
+                    self.lose_ack = False
+                    raise DatabaseOperationError("Commit acknowledgement lost")
+        repository = AcknowledgementRepository()
+        with patch.object(Neo4jRepository, "_require_constraints"), \
+             patch.object(Neo4jRepository, "_duplicate_title", return_value=False):
+            with self.assertRaises(DatabaseOperationError):
+                self.store.save(case_id, item["revision"], repository)
+        reopened = Store(self.store.path)
+        self.assertEqual(reopened.get(case_id)["status"], "upload_failed")
+        with patch("lfe.store.graph_mapping", side_effect=AssertionError("Mapping must stay frozen")), \
+             patch.object(Neo4jRepository, "_require_constraints", side_effect=GraphSchemaError("New schema")):
+            saved = reopened.save(case_id, reopened.get(case_id)["revision"], repository)
+        self.assertEqual(saved["status"], "saved")
+        self.assertEqual(sum(call.args[0].startswith("CREATE") for call in tx.run.call_args_list), 1)
+        self.assertEqual(reopened.audit()[0]["action"], "upload_completed")
+
+    def test_neo4j_5_relationship_uniqueness_metadata_is_recognized(self):
+        rows = [{"entityType": "NODE", "type": "UNIQUENESS", "labelsOrTypes": [label],
+                 "properties": [prop]} for _, label, prop in REQUIRED_CONSTRAINTS]
+        rows += [{"entityType": "RELATIONSHIP", "type": "RELATIONSHIP_UNIQUENESS",
+                  "labelsOrTypes": [label], "properties": [prop]}
+                 for _, label, prop in REQUIRED_RELATIONSHIP_CONSTRAINTS]
+        tx = MagicMock()
+        metadata = MagicMock()
+        metadata.__iter__.return_value = rows
+        legacy = MagicMock()
+        legacy.single.return_value = {"count": 0}
+        tx.run.side_effect = [metadata, legacy]
+        Neo4jRepository._require_constraints(tx)
 
     def test_legacy_saved_case_is_preserved_in_history(self):
         path = Path(self.temp.name) / "legacy.db"
@@ -330,6 +502,26 @@ class WorkflowTests(unittest.TestCase):
             neo4j_environment(True, {}, self.temp.name)
         self.assertNotIn("dummy-secret", str(error.exception))
 
+    def test_server_only_model_env_is_opt_in_and_does_not_enable_personal_login(self):
+        path = Path(self.temp.name) / ".env"
+        path.write_text("LFE_MODEL_PROVIDER=manual\nCOPILOT_GITHUB_TOKEN=dummy-service-token\n"
+                        "NEO4J_PASSWORD=ignored-dummy\n", encoding="utf-8")
+        self.assertEqual(model_environment(False, {}, self.temp.name), {})
+        settings = model_environment(True, {}, self.temp.name)
+        self.assertNotIn("NEO4J_PASSWORD", settings)
+        self.assertEqual(settings["COPILOT_GITHUB_TOKEN"], "dummy-service-token")
+        self.assertIsInstance(configured_adapter(settings), ManualAdapter)
+        self.assertIsInstance(configured_adapter({"COPILOT_GITHUB_TOKEN": "dummy-service-token"}), ManualAdapter)
+        for provider in ("copilot", "dummy-invalid-provider"):
+            settings = model_environment(True, {"LFE_MODEL_PROVIDER": provider}, self.temp.name)
+            with self.assertRaises(ValueError) as error:
+                configured_adapter(settings)
+            self.assertNotIn("dummy-service-token", str(error.exception))
+        path.write_text("invalid setting dummy-service-token\n", encoding="utf-8")
+        with self.assertRaises(ValueError) as error:
+            model_environment(True, {}, self.temp.name)
+        self.assertNotIn("dummy-service-token", str(error.exception))
+
     def test_mocked_driver_read_check_and_approved_write(self):
         repo = Neo4jRepository({"NEO4J_URI": "neo4j+s://example.invalid",
                                 "NEO4J_USERNAME": "user", "NEO4J_PASSWORD": "dummy-secret"})
@@ -375,6 +567,8 @@ class WorkflowTests(unittest.TestCase):
                     return Result(single={"count": 0})
                 if "title_key: $title_key" in query:
                     return Result()
+                if "RETURN c.upload_fingerprint" in query:
+                    return Result()
                 return Result() if "RETURN" not in query else []
         tx = Tx()
         graph = graph_mapping(str(uuid.uuid4()), {"title": "Case", "activity": "x' MATCH (n) DETACH DELETE n"}, {})
@@ -390,7 +584,7 @@ class WorkflowTests(unittest.TestCase):
         tx.run.return_value = []
         graph = graph_mapping(str(uuid.uuid4()), {"title": "Case"}, {})
         with self.assertRaisesRegex(DatabaseOperationError, "constraints are missing"):
-            Neo4jRepository._write_transaction(tx, graph)
+            Neo4jRepository._require_constraints(tx)
         self.assertEqual(tx.run.call_count, 1)
         node_constraints = [{"entityType": "NODE", "type": "NODE_PROPERTY_UNIQUENESS",
                              "labelsOrTypes": [label], "properties": [prop]}
@@ -398,7 +592,7 @@ class WorkflowTests(unittest.TestCase):
         tx = MagicMock()
         tx.run.return_value.__iter__.return_value = node_constraints
         with self.assertRaisesRegex(GraphSchemaError, "constraints are missing"):
-            Neo4jRepository._write_transaction(tx, graph)
+            Neo4jRepository._require_constraints(tx)
         self.assertEqual(tx.run.call_count, 1)
 
     def test_shared_merge_keeps_case_specific_relationship_properties(self):
@@ -408,7 +602,8 @@ class WorkflowTests(unittest.TestCase):
                                                   "product_context": "Second context"}, {})
         tx = MagicMock()
         tx.run.return_value.single.return_value = {"count": 0}
-        with patch.object(Neo4jRepository, "_require_constraints"), \
+        with patch.object(Neo4jRepository, "_committed_upload", return_value=False), \
+             patch.object(Neo4jRepository, "_require_constraints"), \
              patch.object(Neo4jRepository, "_duplicate_title", return_value=False):
             Neo4jRepository._write_transaction(tx, first)
             Neo4jRepository._write_transaction(tx, second)
@@ -496,7 +691,8 @@ class WorkflowTests(unittest.TestCase):
                               "machine": "Capping Machine", "component": "Inner Guide"}, {})
         tx = MagicMock()
         tx.run.return_value.single.return_value = {"count": 0}
-        with patch.object(Neo4jRepository, "_require_constraints"), \
+        with patch.object(Neo4jRepository, "_committed_upload", return_value=False), \
+             patch.object(Neo4jRepository, "_require_constraints"), \
              patch.object(Neo4jRepository, "_duplicate_title", return_value=False):
             Neo4jRepository._write_transaction(tx, graph)
             Neo4jRepository._write_transaction(tx, graph)
@@ -517,7 +713,8 @@ class WorkflowTests(unittest.TestCase):
                               "component": "Chute"}, {})
         tx = MagicMock()
         tx.run.return_value.single.return_value = {"count": 0}
-        with patch.object(Neo4jRepository, "_require_constraints"), \
+        with patch.object(Neo4jRepository, "_committed_upload", return_value=False), \
+             patch.object(Neo4jRepository, "_require_constraints"), \
              patch.object(Neo4jRepository, "_duplicate_title", return_value=False):
             Neo4jRepository._write_transaction(tx, graph)
         edge = next(c for c in tx.run.call_args_list if "MERGE (m)-[:HAS_COMPONENT {identity_key: $edge_key}]" in c.args[0])
@@ -539,7 +736,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.store.audit()[0]["action"], "upload_rejected_schema")
         tx = MagicMock()
         tx.run.return_value.single.return_value = {"count": 2}
-        with patch.object(Neo4jRepository, "_require_constraints"):
+        with patch.object(Neo4jRepository, "_committed_upload", return_value=False), \
+             patch.object(Neo4jRepository, "_require_constraints"):
             with self.assertRaisesRegex(GraphSchemaError, "earlier graph mapping"):
                 Neo4jRepository._write_transaction(tx, graph_mapping(case_id, {"title": "Legacy guard"}, {}))
         self.assertEqual(tx.run.call_count, 1)
@@ -553,6 +751,7 @@ class WorkflowTests(unittest.TestCase):
                        {"entityType": "RELATIONSHIP", "type": "RELATIONSHIP_PROPERTY_UNIQUENESS",
                         "labelsOrTypes": [relation], "properties": [prop]}
                        for _, relation, prop in REQUIRED_RELATIONSHIP_CONSTRAINTS]
+        persisted = {}
         def run(query, **params):
             result = MagicMock()
             if query.startswith("SHOW CONSTRAINTS"):
@@ -561,11 +760,16 @@ class WorkflowTests(unittest.TestCase):
                 result.single.return_value = {"count": 0}
             elif "title_key: $title_key" in query:
                 result.single.return_value = None
+            elif "RETURN c.upload_fingerprint" in query:
+                result.single.return_value = persisted.get(params["id"])
+            elif query.startswith("CREATE (c:LFECase"):
+                persisted[params["id"]] = {"fingerprint": params["props"]["upload_fingerprint"]}
             return result
         tx.run.side_effect = run
         Neo4jRepository._write_transaction(tx, graph)
         Neo4jRepository._write_transaction(tx, graph)
-        self.assertEqual(sum("MERGE (c:LFECase" in c.args[0] for c in tx.run.call_args_list), 2)
+        self.assertEqual(sum("CREATE (c:LFECase" in c.args[0] for c in tx.run.call_args_list), 1)
+        persisted.clear()
         def duplicate_run(query, **params):
             result = run(query, **params)
             if "title_key: $title_key" in query:
@@ -605,6 +809,12 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM drafts").fetchone()[0], before)
         sample_draft = post("/api/sample-drafts", {"answers": sample["answers"], "evidence": {}})
         self.assertTrue(sample_draft["is_sample"])
+        request = urllib.request.Request(url + "/api/drafts", headers={"Host": "localhost:8000"})
+        with urllib.request.urlopen(request) as response:
+            drafts = json.load(response)["cases"]
+            self.assertIn(sample_draft["id"], [item["id"] for item in drafts])
+            self.assertNotIn("transcript", drafts[0])
+            self.assertNotIn("upload_graph", drafts[0])
         request = urllib.request.Request(url + f"/api/drafts/{sample_draft['id']}/graph-preview",
                                          headers={"Host": "localhost:8000"})
         with urllib.request.urlopen(request) as response:

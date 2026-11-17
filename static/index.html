@@ -14,10 +14,11 @@
     <p class="side-label">WORKSPACE</p>
     <nav role="tablist" aria-label="Case workflow">
       <button id="tab-button-workspace" role="tab" aria-selected="true" aria-controls="tab-workspace" tabindex="0"><span class="nav-index">01</span> Workspace</button>
-      <button id="tab-button-pending" role="tab" aria-selected="false" aria-controls="tab-pending" tabindex="-1"><span class="nav-index">02</span> Pending approval</button>
-      <button id="tab-button-upload" role="tab" aria-selected="false" aria-controls="tab-upload" tabindex="-1"><span class="nav-index">03</span> Pending upload</button>
-      <button id="tab-button-history" role="tab" aria-selected="false" aria-controls="tab-history" tabindex="-1"><span class="nav-index">04</span> Approved history</button>
-      <button id="tab-button-audit" role="tab" aria-selected="false" aria-controls="tab-audit" tabindex="-1"><span class="nav-index">05</span> Audit trail</button>
+      <button id="tab-button-drafts" role="tab" aria-selected="false" aria-controls="tab-drafts" tabindex="-1"><span class="nav-index">02</span> Saved drafts</button>
+      <button id="tab-button-pending" role="tab" aria-selected="false" aria-controls="tab-pending" tabindex="-1"><span class="nav-index">03</span> Pending approval</button>
+      <button id="tab-button-upload" role="tab" aria-selected="false" aria-controls="tab-upload" tabindex="-1"><span class="nav-index">04</span> Pending upload</button>
+      <button id="tab-button-history" role="tab" aria-selected="false" aria-controls="tab-history" tabindex="-1"><span class="nav-index">05</span> Approved history</button>
+      <button id="tab-button-audit" role="tab" aria-selected="false" aria-controls="tab-audit" tabindex="-1"><span class="nav-index">06</span> Audit trail</button>
     </nav>
     <div class="sidebar-note"><span class="status-dot"></span> Local workspace<br><small>Manual mode · No AI connected</small></div>
   </aside>
@@ -65,6 +66,10 @@
       </div></div>
     </section>
     </div>
+    <section class="panel list-panel" id="tab-drafts" role="tabpanel" aria-labelledby="tab-button-drafts" hidden>
+      <div class="section-heading"><div><p class="eyebrow">SAVED WORK</p><h2>Saved drafts</h2><p>Resume any saved review, including cases returned to draft.</p></div></div>
+      <div id="drafts-list" class="case-list" aria-live="polite"></div>
+    </section>
     <section class="panel list-panel" id="tab-pending" role="tabpanel" aria-labelledby="tab-button-pending" hidden>
       <div class="section-heading"><div><p class="eyebrow">REVIEW QUEUE</p><h2>Pending approval</h2><p>Open each submitted case and review it before approving.</p></div><span class="section-number">02</span></div>
       <div id="pending-list" class="case-list" aria-live="polite"></div>

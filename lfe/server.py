@@ -5,12 +5,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .config import neo4j_environment
-from .model import ManualAdapter
+from .config import model_environment, neo4j_environment
+from .model import configured_adapter
 from .neo4j_repo import ConfigurationError, DatabaseOperationError, Neo4jRepository
 from .samples import samples
 from .schema import FIELDS, QUESTIONS, graph_preview
 from .store import Store
+from .workspace import WorkspaceLock, WorkspaceOwnershipError
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -57,6 +58,8 @@ def handler_for(store, repository, adapter):
                 return self.respond(200, status)
             if path == "/api/pending":
                 return self.respond(200, {"cases": store.pending()})
+            if path == "/api/drafts":
+                return self.respond(200, {"cases": store.drafts()})
             if path == "/api/history":
                 return self.respond(200, {"cases": store.history()})
             if path == "/api/pending-upload":
@@ -141,18 +144,25 @@ def handler_for(store, repository, adapter):
 def main():
     parser = argparse.ArgumentParser(description="Run the local LFE application.")
     parser.add_argument("--env-dev", action="store_true", help="Load Neo4j settings from .env_dev in the current directory.")
+    parser.add_argument("--env", action="store_true", help="Load server-only model settings from .env in the current directory.")
     parser.add_argument("--allow-mock-upload", action="store_true",
                         help="Allow approved mock cases to be uploaded to the configured dedicated test database only.")
     args = parser.parse_args()
     try:
         env = neo4j_environment(use_env_dev=args.env_dev)
+        adapter = configured_adapter(model_environment(use_env=args.env))
     except (ValueError, RuntimeError) as exc:
         parser.exit(2, f"{exc}\n")
     data_dir = Path(os.environ.get("LFE_DATA_DIR", "data"))
-    store = Store(data_dir / "drafts.sqlite3", allow_mock_uploads=args.allow_mock_upload)
-    server = ThreadingHTTPServer((os.environ.get("LFE_LISTEN_HOST", "127.0.0.1"), 8000),
-                                 handler_for(store, Neo4jRepository(env), ManualAdapter()))
-    server.serve_forever()
+    database_path = data_dir / "drafts.sqlite3"
+    try:
+        with WorkspaceLock(database_path) as owner:
+            store = Store(database_path, allow_mock_uploads=args.allow_mock_upload, owner=owner)
+            with ThreadingHTTPServer((os.environ.get("LFE_LISTEN_HOST", "127.0.0.1"), 8000),
+                                     handler_for(store, Neo4jRepository(env), adapter)) as server:
+                server.serve_forever()
+    except WorkspaceOwnershipError as exc:
+        parser.exit(2, f"{exc}\n")
 
 
 if __name__ == "__main__":
