@@ -5,11 +5,11 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .neo4j_repo import DuplicateTitleError, GraphSchemaError
-from .schema import graph_mapping, normalize_answers, normalize_evidence, normalized_name
+from .schema import graph_mapping, normalize_answers, normalize_evidence, normalized_name, preview_graph
 
 
 class Store:
-    def __init__(self, path, allow_mock_uploads=False):
+    def __init__(self, path, allow_mock_uploads=False, owner=None):
         self.path = str(path)
         self.allow_mock_uploads = allow_mock_uploads
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -22,6 +22,8 @@ class Store:
                 db.execute("ALTER TABLE drafts ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
             if "graph_schema_version" not in columns:
                 db.execute("ALTER TABLE drafts ADD COLUMN graph_schema_version INTEGER")
+            if "upload_graph" not in columns:
+                db.execute("ALTER TABLE drafts ADD COLUMN upload_graph TEXT")
             existing_audit = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit_events'").fetchone()
             db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, case_id TEXT NOT NULL,
@@ -31,6 +33,13 @@ class Store:
             if not existing_audit:
                 db.execute("""INSERT INTO audit_events (case_id, action, outcome, to_status)
                               SELECT id, 'legacy_imported', 'recorded', status FROM drafts""")
+        if owner is not None:
+            self.recover_interrupted(owner)
+
+    def recover_interrupted(self, owner):
+        owner.require(self.path)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             interrupted = db.execute("SELECT id FROM drafts WHERE status='writing'").fetchall()
             for row in interrupted:
                 db.execute("UPDATE drafts SET status='upload_failed', revision=revision+1 WHERE id=?", (row["id"],))
@@ -61,6 +70,7 @@ class Store:
         item["answers"] = normalize_answers(json.loads(item["answers"]))
         item["evidence"] = json.loads(item["evidence"])
         item["is_sample"] = bool(item["is_sample"])
+        item.pop("upload_graph", None)
         return item
 
     @staticmethod
@@ -99,6 +109,18 @@ class Store:
     def get(self, case_id):
         with self.connect() as db:
             return self.decode(db.execute("SELECT * FROM drafts WHERE id=?", (case_id,)).fetchone())
+
+    def graph_preview(self, case_id):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM drafts WHERE id=?", (case_id,)).fetchone()
+            item = self.decode(row)
+            frozen = item["status"] in ("writing", "upload_failed", "saved")
+            snapshot = row["upload_graph"] if frozen else None
+            if frozen and not snapshot:
+                raise GraphSchemaError("This older upload has no frozen preview. Reconcile its graph mapping before retrying.")
+            graph = json.loads(snapshot) if snapshot else graph_mapping(case_id, item["answers"], item["evidence"])
+        return {**preview_graph(graph), "revision": item["revision"],
+                "source": "frozen_upload" if snapshot else "current_mapper"}
 
     def record_rejection(self, case_id, action):
         with self.connect() as db:
@@ -154,33 +176,47 @@ class Store:
             if item["status"] not in ("approved", "upload_failed"):
                 raise ValueError("Approve this case before writing it to Neo4j.")
             self._check_title(db, item["answers"]["title"], case_id)
-            db.execute("UPDATE drafts SET status='writing', revision=revision+1 WHERE id=?", (case_id,))
+            snapshot = db.execute("SELECT upload_graph FROM drafts WHERE id=?", (case_id,)).fetchone()["upload_graph"]
+            if item["status"] == "upload_failed" and not snapshot:
+                raise GraphSchemaError("This older uncertain upload has no frozen snapshot. Reconcile its stable case ID before retrying; edits remain locked.")
+            if item["status"] == "upload_failed":
+                graph = json.loads(snapshot)
+            else:
+                graph = graph_mapping(case_id, item["answers"], item["evidence"])
+                if item["is_sample"]:
+                    graph["case"]["is_mock"] = True
+            db.execute("UPDATE drafts SET status='writing', upload_graph=?, revision=revision+1 WHERE id=?",
+                       (json.dumps(graph), case_id))
             self._audit(db, case_id, "upload_started", "started", item["status"], "writing")
         try:
-            graph = graph_mapping(case_id, item["answers"], item["evidence"])
-            if item["is_sample"]:
-                graph["case"]["is_mock"] = True
             repository.write(graph)
         except DuplicateTitleError:
-            with self.connect() as db:
-                db.execute("UPDATE drafts SET status='draft', revision=revision+1 WHERE id=? AND status='writing'", (case_id,))
-                self._audit(db, case_id, "duplicate_title_rejected", "rejected", "writing", "draft")
+            target = "upload_failed" if item["status"] == "upload_failed" else "draft"
+            self._finish_upload(case_id, item["revision"] + 1, target, "duplicate_title_rejected", "rejected")
+            if target == "upload_failed":
+                raise DuplicateTitleError("This upload has an uncertain outcome. Reconcile its stable case ID in Neo4j before retrying; edits remain locked.") from None
             raise
         except GraphSchemaError:
-            with self.connect() as db:
-                db.execute("UPDATE drafts SET status='approved', revision=revision+1 WHERE id=? AND status='writing'", (case_id,))
-                self._audit(db, case_id, "upload_rejected_schema", "rejected", "writing", "approved")
+            self._finish_upload(case_id, item["revision"] + 1, item["status"], "upload_rejected_schema", "rejected")
             raise
         except Exception:
-            with self.connect() as db:
-                db.execute("UPDATE drafts SET status='upload_failed', revision=revision+1 WHERE id=? AND status='writing'", (case_id,))
-                self._audit(db, case_id, "upload_failed", "unknown", "writing", "upload_failed")
+            self._finish_upload(case_id, item["revision"] + 1, "upload_failed", "upload_failed", "unknown")
             raise
-        with self.connect() as db:
-            db.execute("""UPDATE drafts SET status='saved', graph_schema_version=?, revision=revision+1
-                          WHERE id=? AND status='writing'""", (graph["case"]["graph_schema_version"], case_id))
-            self._audit(db, case_id, "upload_completed", "succeeded", "writing", "saved")
+        self._finish_upload(case_id, item["revision"] + 1, "saved", "upload_completed", "succeeded",
+                            graph["case"]["graph_schema_version"])
         return self.get(case_id)
+
+    def _finish_upload(self, case_id, revision, status, action, outcome, graph_version=None):
+        with self.connect() as db:
+            changed = db.execute("""UPDATE drafts SET status=?, graph_schema_version=COALESCE(?,graph_schema_version),
+                                    revision=revision+1 WHERE id=? AND status='writing' AND revision=?""",
+                                 (status, graph_version, case_id, revision)).rowcount
+            if changed != 1:
+                raise RuntimeError("Upload state changed unexpectedly. Reconcile the case before retrying.")
+            self._audit(db, case_id, action, outcome, "writing", status)
+
+    def drafts(self):
+        return self._list_cases("status='draft'")
 
     def pending(self):
         return self._list_cases("status='pending'")

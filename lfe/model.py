@@ -1,5 +1,21 @@
 """Model boundary. No credentials or model calls are made in manual mode."""
+from typing import Protocol
+
 from .schema import FIELDS
+
+
+class ModelAdapter(Protocol):
+    def extract(self, transcript: str) -> dict: ...
+    def answer(self, question: str, cases: list[dict]) -> str: ...
+
+
+def configured_adapter(config) -> ModelAdapter:
+    provider = config.get("LFE_MODEL_PROVIDER", "manual")
+    if provider == "manual":
+        return ManualAdapter()
+    if provider == "copilot":
+        raise ValueError("Copilot inference is disabled until the organization credential, SDK integration, and authenticated VM access are verified. Use LFE_MODEL_PROVIDER=manual.")
+    raise ValueError("Unsupported model provider. Use LFE_MODEL_PROVIDER=manual.")
 
 
 class ManualAdapter:

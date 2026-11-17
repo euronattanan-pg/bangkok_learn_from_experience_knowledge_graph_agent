@@ -3,9 +3,14 @@ let fields = {};
 let questions = [];
 let samples = [];
 let draft = null;
+let mutationPending = false;
+let editGeneration = 0;
+let activeTab = "workspace";
+const disabledControls = new Map();
+const unverifiedCases = new Set();
 let connectionStatus = {configured: false, mock_uploads_allowed: false, message: "Configuration has not been checked."};
 const byId = id => document.getElementById(id);
-const tabNames = ["workspace", "pending", "upload", "history", "audit"];
+const tabNames = ["workspace", "drafts", "pending", "upload", "history", "audit"];
 
 async function request(path, data) {
   const options = data === undefined ? {} : {
@@ -20,6 +25,59 @@ async function request(path, data) {
 async function run(action) {
   byId("error").textContent = "";
   try { await action(); } catch (error) { byId("error").textContent = error.message; }
+}
+
+function lockControls() {
+  if (!mutationPending) return;
+  document.querySelectorAll("button, input, textarea, select").forEach(control => {
+    if (!disabledControls.has(control)) disabledControls.set(control, control.disabled);
+    control.disabled = true;
+  });
+}
+
+function restoreControls() {
+  for (const [control, disabled] of disabledControls) {
+    if (control.isConnected) control.disabled = disabled;
+  }
+  disabledControls.clear();
+}
+
+async function mutate(action) {
+  if (mutationPending) return;
+  mutationPending = true;
+  lockControls();
+  try { return await action(); } finally {
+    mutationPending = false;
+    restoreControls();
+  }
+}
+
+function workspaceToken() {
+  return {selected: draft, generation: editGeneration};
+}
+
+function applyWorkspace(updated, token, preserveTranscript = false) {
+  if (draft !== token.selected || editGeneration !== token.generation) return false;
+  draft = updated;
+  editGeneration++;
+  unverifiedCases.delete(draft.id);
+  localStorage.setItem("lfeDraft", draft.id);
+  if (!preserveTranscript && (!token.selected || token.selected.id !== updated.id)) {
+    byId("transcript").value = draft.transcript || "";
+  }
+  render();
+  return true;
+}
+
+function refreshWorkspace(updated, token) {
+  if (!draft || draft.id !== updated.id || draft !== token.selected) return;
+  unverifiedCases.delete(updated.id);
+  if (!applyWorkspace(updated, token)) {
+    draft = updated;
+    restoreControls();
+    renderControls();
+    lockControls();
+  }
 }
 
 function statusLabel(item) {
@@ -43,6 +101,7 @@ function statusLabel(item) {
 }
 
 async function showTab(name) {
+  activeTab = name;
   for (const tab of tabNames) {
     const active = name === tab;
     byId(`tab-${tab}`).hidden = !active;
@@ -50,19 +109,24 @@ async function showTab(name) {
     byId(`tab-button-${tab}`).tabIndex = active ? 0 : -1;
   }
   byId("search-section").hidden = name !== "workspace";
-  if (name === "pending" || name === "history") {
+  if (name === "pending" || name === "history" || name === "drafts") {
     const cases = (await request(`/api/${name}`)).cases;
-    renderCaseList(name, cases);
+    if (activeTab === name) renderCaseList(name, cases);
   } else if (name === "upload") {
     const [status, queue] = await Promise.all([request("/api/connection"), request("/api/pending-upload")]);
-    connectionStatus = status;
-    renderUploadList(queue.cases);
+    if (activeTab === name) {
+      connectionStatus = status;
+      renderUploadList(queue.cases);
+    }
   } else if (name === "audit") {
-    renderAudit((await request("/api/audit")).events);
+    const events = (await request("/api/audit")).events;
+    if (activeTab === name) renderAudit(events);
   }
+  lockControls();
 }
 
 function uploadUnavailable(item) {
+  if (unverifiedCases.has(item.id)) return "Upload status is unknown. Reopen this case before editing or retrying.";
   if (item.status === "writing") return "Upload is in progress.";
   if (item.is_sample && !connectionStatus.mock_uploads_allowed) {
     return "Mock uploads are disabled. Enable test-database mode only for a dedicated test database.";
@@ -85,7 +149,8 @@ async function showGraphPreview(target, item) {
   target.replaceChildren();
   const title = document.createElement("p");
   title.className = "upload-meta";
-  title.textContent = `Proposed mapping (not the current graph) for ${preview.case_name}. Review the separated names and source answers before approval or upload.`;
+  const source = preview.source === "frozen_upload" ? "Frozen upload snapshot" : "Proposed mapping (not the current graph)";
+  title.textContent = `${source} for ${preview.case_name}. Review the separated names and source answers before approval or upload.`;
   const list = document.createElement("ul");
   for (const entry of preview.entries) {
     const row = document.createElement("li");
@@ -158,17 +223,10 @@ function renderUploadList(cases) {
     upload.className = "button primary";
     upload.textContent = item.status === "upload_failed" ? "Retry upload" : "Upload to Neo4j";
     upload.disabled = Boolean(uploadUnavailable(item));
-    upload.addEventListener("click", () => run(async () => {
+    upload.addEventListener("click", () => run(() => mutate(async () => {
       if (!confirm(uploadConfirmation(item))) return;
-      try {
-        const updated = await request(`/api/drafts/${item.id}/save`, {revision: item.revision});
-        if (draft && draft.id === item.id) { draft = updated; render(); }
-      } catch (error) {
-        await showTab("upload");
-        throw error;
-      }
-      await showTab("history");
-    }));
+      await uploadCase(item);
+    })));
     card.append(heading, meta, detail, previewButton, preview, reason, upload);
     list.append(card);
   }
@@ -180,7 +238,8 @@ function renderCaseList(name, cases) {
   if (!cases.length) {
     const empty = document.createElement("p");
     empty.className = "empty-list";
-    empty.textContent = name === "pending" ? "No cases are awaiting approval." : "No approved cases yet.";
+    empty.textContent = name === "pending" ? "No cases are awaiting approval."
+      : name === "drafts" ? "No saved drafts yet." : "No approved cases yet.";
     list.append(empty);
     return;
   }
@@ -198,15 +257,14 @@ function renderCaseList(name, cases) {
     const open = document.createElement("button");
     open.className = "button secondary";
     open.textContent = "Open review";
-    open.addEventListener("click", () => run(async () => {
+    open.addEventListener("click", () => run(() => mutate(async () => {
       if (draft && !confirm("Open another case? Unsaved edits in the current review will be lost.")) return;
-      draft = await request(`/api/drafts/${encodeURIComponent(item.id)}`);
-      localStorage.setItem("lfeDraft", draft.id);
-      byId("transcript").value = draft.transcript;
-      render();
+      const token = workspaceToken();
+      const updated = await request(`/api/drafts/${encodeURIComponent(item.id)}`);
+      if (!applyWorkspace(updated, token)) return;
       await showTab("workspace");
       byId("review").scrollIntoView();
-    }));
+    })));
     row.append(details, open);
     list.append(row);
   }
@@ -254,6 +312,7 @@ for (const name of tabNames) {
 }
 
 function render() {
+  restoreControls();
   byId("review").hidden = false;
   byId("status").textContent = draft.id
     ? `${statusLabel(draft)} · ${draft.id}`
@@ -299,7 +358,7 @@ function render() {
         input.value = draft.answers[key] ?? "";
       }
       input.id = `field-${key}`;
-      input.addEventListener("input", () => byId("graph-preview").replaceChildren());
+      input.addEventListener("input", () => { editGeneration++; byId("graph-preview").replaceChildren(); });
       const hints = {
         project: "Separate multiple names with semicolons or new lines; quote a name containing a delimiter.",
         product: "Separate multiple names with semicolons or new lines; quote a name containing a delimiter.",
@@ -328,20 +387,26 @@ function render() {
       evidence.id = `evidence-${key}`;
       evidence.rows = 2;
       evidence.value = draft.evidence[key] || "";
-      evidence.addEventListener("input", () => byId("graph-preview").replaceChildren());
+      evidence.addEventListener("input", () => { editGeneration++; byId("graph-preview").replaceChildren(); });
       wrapper.append(evidenceLabel, evidence);
       content.append(wrapper);
     }
     group.append(content);
     byId("fields").append(group);
   }
-  const locked = ["saved", "writing", "upload_failed", "upload_unverified"].includes(draft.status);
+  renderControls();
+  lockControls();
+}
+
+function renderControls() {
+  const unverified = unverifiedCases.has(draft.id);
+  const locked = unverified || ["saved", "writing", "upload_failed", "upload_unverified"].includes(draft.status);
   byId("fields").querySelectorAll("textarea, input, select").forEach(element => { element.disabled = locked; });
   byId("update").disabled = locked;
-  byId("preview-graph").disabled = !draft.id;
+  byId("preview-graph").disabled = !draft.id || unverified;
   byId("graph-preview").replaceChildren();
-  byId("submit").disabled = draft.status !== "draft" || !draft.id;
-  byId("approve").disabled = draft.status !== "pending" || !draft.id;
+  byId("submit").disabled = unverified || draft.status !== "draft" || !draft.id;
+  byId("approve").disabled = unverified || draft.status !== "pending" || !draft.id;
   const reason = uploadUnavailable(draft);
   byId("save").disabled = !["approved", "upload_failed"].includes(draft.status) || Boolean(reason);
   byId("upload-explanation").textContent = reason || (!["approved", "upload_failed"].includes(draft.status) ? "Submit and approve this case before uploading." : "");
@@ -356,14 +421,53 @@ function hasChanges() {
 }
 
 async function saveReview() {
+  const token = workspaceToken();
   const values = reviewedValues();
+  let updated;
   if (draft.is_sample && !draft.id) {
-    draft = await request("/api/sample-drafts", values);
-    localStorage.setItem("lfeDraft", draft.id);
+    updated = await request("/api/sample-drafts", values);
   } else {
-    draft = await request(`/api/drafts/${draft.id}/update`, {...values, revision: draft.revision});
+    updated = await request(`/api/drafts/${draft.id}/update`, {...values, revision: draft.revision});
   }
-  render();
+  if (!applyWorkspace(updated, token, true)) {
+    if (draft === token.selected) {
+      // Advance the server baseline without replacing input entered after this save.
+      draft = updated;
+      localStorage.setItem("lfeDraft", draft.id);
+      restoreControls();
+      renderControls();
+      lockControls();
+    }
+    byId("notice").textContent = "The submitted snapshot was saved. Later edits were not replaced and still need saving.";
+  }
+}
+
+async function uploadCase(item) {
+  const token = workspaceToken();
+  try {
+    const updated = await request(`/api/drafts/${item.id}/save`, {revision: item.revision});
+    if (draft && draft.id === item.id) refreshWorkspace(updated, token);
+  } catch (error) {
+    let refreshFailed = false;
+    try {
+      const updated = await request(`/api/drafts/${item.id}`);
+      if (draft && draft.id === item.id) refreshWorkspace(updated, token);
+    } catch (refreshError) {
+      refreshFailed = true;
+      unverifiedCases.add(item.id);
+      if (draft && draft.id === item.id) {
+        restoreControls();
+        renderControls();
+        lockControls();
+      }
+    }
+    // Drop stale controls before refetching; a failed refresh must not leave a retry enabled.
+    byId("upload-list").replaceChildren();
+    try { await showTab("upload"); } catch (refreshError) { refreshFailed = true; }
+    if (refreshFailed) throw new Error(`${error.message} Upload status could not be refreshed. Reload the case before retrying.`);
+    throw error;
+  }
+  await showTab("history");
 }
 
 function reviewedValues() {
@@ -380,19 +484,20 @@ function reviewedValues() {
   return {answers, evidence};
 }
 
-byId("create").addEventListener("click", () => run(async () => {
+byId("create").addEventListener("click", () => run(() => mutate(async () => {
   if (draft && !confirm("Replace the current review? Unsaved edits will be lost.")) return;
+  const token = workspaceToken();
   const result = await request("/api/drafts", {transcript: byId("transcript").value});
-  draft = result.draft;
-  localStorage.setItem("lfeDraft", draft.id);
+  if (!applyWorkspace(result.draft, token)) return;
   byId("notice").textContent = result.notice;
-  render();
-}));
+})));
 byId("load-sample").addEventListener("click", () => run(async () => {
+  if (mutationPending) return;
   const sample = samples.find(item => item.id === byId("sample").value);
   if (!sample) throw new Error("Select a mock case first.");
   if (draft && !confirm("Replace the current review? Unsaved edits will be lost.")) return;
   draft = {id: null, status: "draft", is_sample: true, answers: {...sample.answers}, evidence: {}};
+  editGeneration++;
   byId("transcript").value = "";
   byId("notice").textContent = "Mock case loaded for review only; it has not been saved.";
   render();
@@ -401,40 +506,30 @@ byId("preview-graph").addEventListener("click", () => run(async () => {
   if (hasChanges()) throw new Error("Save the review before previewing its graph mapping.");
   await showGraphPreview(byId("graph-preview"), draft);
 }));
-byId("update").addEventListener("click", () => run(async () => {
+byId("update").addEventListener("click", () => run(() => mutate(async () => {
   await saveReview();
-}));
-byId("submit").addEventListener("click", () => run(async () => {
+})));
+byId("submit").addEventListener("click", () => run(() => mutate(async () => {
   if (hasChanges()) throw new Error("Save the review before submitting for approval.");
-  draft = await request(`/api/drafts/${draft.id}/submit`, {revision: draft.revision});
-  render();
+  const token = workspaceToken();
+  const updated = await request(`/api/drafts/${draft.id}/submit`, {revision: draft.revision});
+  if (!applyWorkspace(updated, token)) return;
   await showTab("pending");
-}));
-byId("approve").addEventListener("click", () => run(async () => {
+})));
+byId("approve").addEventListener("click", () => run(() => mutate(async () => {
   if (hasChanges()) throw new Error("Save edits and submit again before approval.");
-  draft = await request(`/api/drafts/${draft.id}/approve`, {revision: draft.revision});
-  render();
+  const token = workspaceToken();
+  const updated = await request(`/api/drafts/${draft.id}/approve`, {revision: draft.revision});
+  if (!applyWorkspace(updated, token)) return;
   await showTab("upload");
-}));
-byId("save").addEventListener("click", () => run(async () => {
+})));
+byId("save").addEventListener("click", () => run(() => mutate(async () => {
   if (hasChanges()) {
     throw new Error("Answers changed after approval. Save and approve them again.");
   }
   if (!confirm(uploadConfirmation(draft))) return;
-  try {
-    draft = await request(`/api/drafts/${draft.id}/save`, {revision: draft.revision});
-  } catch (error) {
-    try {
-      draft = await request(`/api/drafts/${draft.id}`);
-      render();
-    } catch (refreshError) {
-      throw new Error("Upload failed and its status could not be refreshed. Reload the case before retrying.");
-    }
-    throw error;
-  }
-  render();
-  await showTab("history");
-}));
+  await uploadCase(draft);
+})));
 byId("search").addEventListener("click", () => run(async () => {
   const result = await request("/api/qa", {question: byId("question").value});
   byId("answer").textContent = result.answer;
@@ -449,10 +544,11 @@ byId("check-connection").addEventListener("click", async () => {
   } catch (error) {
     byId("connection-status").textContent = error.message;
   } finally {
-    button.disabled = false;
+    if (mutationPending) disabledControls.set(button, false);
+    button.disabled = mutationPending;
   }
 });
-run(async () => {
+run(() => mutate(async () => {
   const schema = await request("/api/schema");
   fields = schema.fields;
   questions = schema.questions;
@@ -467,8 +563,12 @@ run(async () => {
   }
   const id = localStorage.getItem("lfeDraft");
   if (id) {
-    draft = await request(`/api/drafts/${encodeURIComponent(id)}`);
-    byId("transcript").value = draft.transcript;
-    render();
+    const token = workspaceToken();
+    try {
+      const updated = await request(`/api/drafts/${encodeURIComponent(id)}`);
+      applyWorkspace(updated, token);
+    } catch (error) {
+      byId("notice").textContent = "The last case could not be restored. Use Saved drafts to resume saved work.";
+    }
   }
-});
+}));
