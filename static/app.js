@@ -6,6 +6,8 @@ let draft = null;
 let mutationPending = false;
 let editGeneration = 0;
 let activeTab = "workspace";
+let mappingRequired = false;
+let modelStatus = {provider: "manual", cli_available: false};
 const disabledControls = new Map();
 const unverifiedCases = new Set();
 let connectionStatus = {configured: false, mock_uploads_allowed: false, message: "Configuration has not been checked."};
@@ -116,6 +118,7 @@ async function showTab(name) {
     const [status, queue] = await Promise.all([request("/api/connection"), request("/api/pending-upload")]);
     if (activeTab === name) {
       connectionStatus = status;
+      mappingRequired = queue.mapping_required === true;
       renderUploadList(queue.cases);
     }
   } else if (name === "audit") {
@@ -128,6 +131,9 @@ async function showTab(name) {
 function uploadUnavailable(item) {
   if (unverifiedCases.has(item.id)) return "Upload status is unknown. Reopen this case before editing or retrying.";
   if (item.status === "writing") return "Upload is in progress.";
+  if (mappingRequired && item.status === "approved" && !item.graph_mapping_approved) {
+    return "Generate, review, and confirm the Copilot graph mapping before uploading.";
+  }
   if (item.is_sample && !connectionStatus.mock_uploads_allowed) {
     return "Mock uploads are disabled. Enable test-database mode only for a dedicated test database.";
   }
@@ -149,8 +155,12 @@ async function showGraphPreview(target, item) {
   target.replaceChildren();
   const title = document.createElement("p");
   title.className = "upload-meta";
-  const source = preview.source === "frozen_upload" ? "Frozen upload snapshot" : "Proposed mapping (not the current graph)";
-  title.textContent = `${source} for ${preview.case_name}. Review the separated names and source answers before approval or upload.`;
+  const source = preview.source === "frozen_upload" ? "Frozen upload snapshot"
+    : preview.source === "copilot_proposal" ? "Copilot structured mapping proposal"
+      : "Deterministic mapping preview";
+  title.textContent = `${source} for ${preview.case_name}. ${
+    preview.mapping_approved ? "Confirmed mapping will be used for upload."
+      : "Review the separated names and source answers before upload."}`;
   const list = document.createElement("ul");
   for (const entry of preview.entries) {
     const row = document.createElement("li");
@@ -161,6 +171,18 @@ async function showGraphPreview(target, item) {
     list.append(row);
   }
   target.append(title, list);
+  if (preview.unresolved.length) {
+    const heading = document.createElement("p");
+    heading.className = "upload-meta";
+    heading.textContent = "Unresolved entities must be corrected in the questionnaire, then resubmitted and reapproved:";
+    const issues = document.createElement("ul");
+    for (const issue of preview.unresolved) {
+      const row = document.createElement("li");
+      row.textContent = `${issue.field}: “${issue.excerpt}” — ${issue.reason}`;
+      issues.append(row);
+    }
+    target.append(heading, issues);
+  }
 }
 
 function renderUploadList(cases) {
@@ -219,6 +241,56 @@ function renderUploadList(cases) {
     const preview = document.createElement("div");
     preview.setAttribute("aria-live", "polite");
     previewButton.addEventListener("click", () => run(() => showGraphPreview(preview, item)));
+    if (mappingRequired && item.status === "approved") {
+      const mappingButton = document.createElement("button");
+      mappingButton.className = "button secondary mapping-generate";
+      mappingButton.textContent = item.graph_mapping_proposal ? "Regenerate Copilot mapping" : "Generate Copilot mapping";
+      mappingButton.disabled = item.graph_mapping_approved;
+      mappingButton.addEventListener("click", () => run(() => mutate(async () => {
+        const mapped = await request(`/api/drafts/${encodeURIComponent(item.id)}/map`, {revision: item.revision});
+        item.graph_mapping_proposal = mapped.graph_mapping_proposal;
+        item.graph_mapping_approved = false;
+        item.revision = mapped.revision;
+        await showGraphPreview(preview, item);
+        mappingButton.textContent = "Regenerate Copilot mapping";
+        upload.disabled = true;
+        reason.textContent = mapped.graph_mapping_proposal.unresolved.length
+          ? "Resolve the flagged entities in the questionnaire, then resubmit and reapprove."
+          : "Review the proposal below, then confirm it before upload.";
+        confirmMapping.hidden = mapped.graph_mapping_proposal.unresolved.length > 0;
+        correctMapping.hidden = mapped.graph_mapping_proposal.unresolved.length === 0;
+      })));
+      const confirmMapping = document.createElement("button");
+      confirmMapping.className = "button secondary mapping-confirm";
+      confirmMapping.textContent = "Confirm graph mapping";
+      confirmMapping.hidden = !item.graph_mapping_proposal || item.graph_mapping_proposal.unresolved.length > 0;
+      confirmMapping.disabled = item.graph_mapping_approved;
+      confirmMapping.addEventListener("click", () => run(() => mutate(async () => {
+        const confirmed = await request(`/api/drafts/${encodeURIComponent(item.id)}/confirm-mapping`,
+          {revision: item.revision});
+        item.graph_mapping_proposal = confirmed.graph_mapping_proposal;
+        item.graph_mapping_approved = confirmed.graph_mapping_approved;
+        item.revision = confirmed.revision;
+        await showGraphPreview(preview, item);
+        await showTab("upload");
+      })));
+      const correctMapping = document.createElement("button");
+      correctMapping.className = "button secondary mapping-correct";
+      correctMapping.textContent = "Open review to correct";
+      correctMapping.hidden = !item.graph_mapping_proposal || !item.graph_mapping_proposal.unresolved.length;
+      correctMapping.addEventListener("click", () => run(() => mutate(async () => {
+        if (draft && !confirm("Open this approved case for correction? Saving changes will return it to draft and require approval again.")) return;
+        const token = workspaceToken();
+        const updated = await request(`/api/drafts/${encodeURIComponent(item.id)}`);
+        if (!applyWorkspace(updated, token)) return;
+        await showTab("workspace");
+        byId("review").scrollIntoView();
+      })));
+      if (item.graph_mapping_proposal) {
+        showGraphPreview(preview, item).catch(error => { byId("error").textContent = error.message; });
+      }
+      card.append(mappingButton, confirmMapping, correctMapping);
+    }
     const upload = document.createElement("button");
     upload.className = "button primary";
     upload.textContent = item.status === "upload_failed" ? "Retry upload" : "Upload to Neo4j";
@@ -554,6 +626,12 @@ run(() => mutate(async () => {
   questions = schema.questions;
   connectionStatus = await request("/api/connection");
   byId("connection-status").textContent = connectionStatus.message;
+  modelStatus = await request("/api/model");
+  byId("model-status").textContent = modelStatus.provider === "copilot-local-cli"
+    ? !modelStatus.cli_available ? "Copilot CLI not found · install and sign in locally"
+      : !modelStatus.runtime_available ? `Copilot SDK unavailable · ${modelStatus.message}`
+        : "Copilot local CLI · account checked on first AI request"
+    : "Manual mode · no AI requests";
   samples = (await request("/api/samples")).samples;
   for (const sample of samples) {
     const option = document.createElement("option");

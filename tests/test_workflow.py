@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -14,7 +15,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from lfe.config import model_environment, neo4j_environment
-from lfe.model import ManualAdapter, configured_adapter
+from lfe.model import ManualAdapter, ModelProviderError, configured_adapter
+from lfe.query_plan import compile_read_plan
 from lfe.neo4j_repo import (ConfigurationError, DatabaseOperationError, DuplicateTitleError, GraphSchemaError,
                             Neo4jRepository, REQUIRED_CONSTRAINTS, REQUIRED_RELATIONSHIP_CONSTRAINTS)
 from lfe.neo4j_repo import graph_fingerprint
@@ -35,6 +37,10 @@ class FakeRepository:
 
     def search(self, question):
         self.queries.append(question)
+        return [{"id": "case-1", "title": "Pump", "activity": "Stopped"}]
+
+    def search_plan(self, plan):
+        self.queries.append(plan)
         return [{"id": "case-1", "title": "Pump", "activity": "Stopped"}]
 
     def status(self):
@@ -160,6 +166,69 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.store.audit()[0]["action"], "upload_failed")
         self.assertEqual(self.store.history()[0]["status"], "upload_failed")
         self.assertEqual(self.store.save(case_id, self.store.get(case_id)["revision"], self.repo)["status"], "saved")
+
+    def test_confirmed_graph_mapping_is_bound_to_approved_upload_snapshot(self):
+        answers = normalize_answers({
+            "title": "Mapped case", "project": "Project A; Project B",
+            "line": "B7", "machine": "Capper", "component": "Chute, Inner Guide",
+        })
+        item = self.store.create("", {"answers": answers, "evidence": {}})
+        item = self.store.update(item["id"], answers, {}, item["revision"])
+        item = self.approve_case(item["id"])
+        approval_revision = item["revision"]
+        item = self.store.propose_graph_mapping(item["id"], item["revision"],
+                                                self.adapter.map_graph(answers))
+        self.assertFalse(item["graph_mapping_approved"])
+        with self.assertRaisesRegex(ValueError, "changed"):
+            self.store.propose_graph_mapping(item["id"], approval_revision,
+                                             self.adapter.map_graph(answers))
+        reopened = Store(self.store.path)
+        self.assertEqual(reopened.get(item["id"])["graph_mapping_proposal"],
+                         item["graph_mapping_proposal"])
+        with self.assertRaisesRegex(ValueError, "confirm the Copilot graph mapping"):
+            self.store.save(item["id"], item["revision"], self.repo, require_mapping=True)
+        self.assertEqual(self.repo.graphs, [])
+
+        item = self.store.confirm_graph_mapping(item["id"], item["revision"])
+        self.assertTrue(item["graph_mapping_approved"])
+        saved = self.store.save(item["id"], item["revision"], self.repo, require_mapping=True)
+        self.assertEqual(saved["status"], "saved")
+        graph = self.repo.graphs[0]
+        self.assertEqual(
+            [node["properties"]["name"] for node in graph["nodes"] if node["label"] == "Project"],
+            ["Project A", "Project B"],
+        )
+        self.assertEqual(
+            [node["properties"]["name"] for node in graph["nodes"] if node["label"] == "MachineComponent"],
+            ["Chute", "Inner Guide"],
+        )
+        with self.store.connect() as db:
+            frozen = json.loads(db.execute("SELECT upload_graph FROM drafts WHERE id=?",
+                                            (item["id"],)).fetchone()["upload_graph"])
+        self.assertEqual(frozen, graph)
+        actions = {event["action"] for event in self.store.audit() if event["case_id"] == item["id"]}
+        self.assertIn("graph_mapping_proposed", actions)
+        self.assertIn("graph_mapping_confirmed", actions)
+
+    def test_ambiguous_graph_mapping_cannot_be_confirmed_and_edit_clears_proposal(self):
+        answers = normalize_answers({"title": "Needs clarification", "project": "Project A or B"})
+        item = self.store.create("", {"answers": answers, "evidence": {}})
+        item = self.store.update(item["id"], answers, {}, item["revision"])
+        item = self.approve_case(item["id"])
+        proposal = self.adapter.map_graph(answers)
+        proposal["entities"]["project"] = []
+        proposal["unresolved"] = [{
+            "field": "project", "excerpt": "Project A or B",
+            "reason": "The answer names alternatives without identifying the selected project.",
+        }]
+        item = self.store.propose_graph_mapping(item["id"], item["revision"], proposal)
+        with self.assertRaisesRegex(ValueError, "Resolve the flagged graph entities"):
+            self.store.confirm_graph_mapping(item["id"], item["revision"])
+        changed_answers = dict(item["answers"], project="Project A")
+        item = self.store.update(item["id"], changed_answers, item["evidence"], item["revision"])
+        self.assertEqual(item["status"], "draft")
+        self.assertIsNone(item["graph_mapping_proposal"])
+        self.assertFalse(item["graph_mapping_approved"])
 
     def test_pending_history_audit_and_restart(self):
         case_id = self.item["id"]
@@ -516,10 +585,15 @@ class WorkflowTests(unittest.TestCase):
         path = Path(self.temp.name) / ".env"
         path.write_text("LFE_MODEL_PROVIDER=manual\nCOPILOT_GITHUB_TOKEN=dummy-service-token\n"
                         "NEO4J_PASSWORD=ignored-dummy\n", encoding="utf-8")
-        self.assertEqual(model_environment(False, {}, self.temp.name), {})
+        self.assertEqual(model_environment(False, {}, self.temp.name), {"LFE_SDK_ENV_CONFLICTS": []})
         settings = model_environment(True, {}, self.temp.name)
         self.assertNotIn("NEO4J_PASSWORD", settings)
-        self.assertEqual(settings["COPILOT_GITHUB_TOKEN"], "dummy-service-token")
+        self.assertNotIn("COPILOT_GITHUB_TOKEN", settings)
+        self.assertEqual(settings["LFE_SDK_ENV_CONFLICTS"], ["COPILOT_GITHUB_TOKEN"])
+        process_settings = model_environment(False, {"GH_TOKEN": "dummy-gh-token"}, self.temp.name)
+        self.assertNotIn("GH_TOKEN", process_settings)
+        self.assertEqual(process_settings["LFE_SDK_ENV_CONFLICTS"], ["GH_TOKEN"])
+        self.assertNotIn("dummy-gh-token", repr(process_settings))
         self.assertIsInstance(configured_adapter(settings), ManualAdapter)
         self.assertIsInstance(configured_adapter({"COPILOT_GITHUB_TOKEN": "dummy-service-token"}), ManualAdapter)
         for provider in ("copilot", "dummy-invalid-provider"):
@@ -527,6 +601,23 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaises(ValueError) as error:
                 configured_adapter(settings)
             self.assertNotIn("dummy-service-token", str(error.exception))
+        local = {"LFE_MODEL_PROVIDER": "copilot-local-cli", "LFE_COPILOT_AUTH": "local-cli",
+                 "LFE_DEPLOYMENT_MODE": "local", "LFE_SDK_ENV_CONFLICTS": ["GH_TOKEN"]}
+        with self.assertRaisesRegex(ValueError, "GH_TOKEN"):
+            configured_adapter(local, allow_local_copilot=True, deployment_mode="local")
+        local["LFE_SDK_ENV_CONFLICTS"] = []
+        with self.assertRaisesRegex(ValueError, "opt-in"):
+            configured_adapter(local, deployment_mode="local")
+        with self.assertRaisesRegex(ValueError, "network binding"):
+            configured_adapter(local, allow_local_copilot=True, listen_host="0.0.0.0", deployment_mode="local")
+        with self.assertRaisesRegex(ValueError, "VM or shared"):
+            configured_adapter(local, allow_local_copilot=True, deployment_mode="vm")
+        previous_download_setting = os.environ.get("COPILOT_SKIP_CLI_DOWNLOAD")
+        with patch.dict("os.environ", {"COPILOT_SKIP_CLI_DOWNLOAD": "0"}):
+            configured_adapter(local, allow_local_copilot=True, deployment_mode="local",
+                               cli_lookup=lambda _: "copilot")
+            self.assertEqual(os.environ["COPILOT_SKIP_CLI_DOWNLOAD"], "1")
+        self.assertEqual(os.environ.get("COPILOT_SKIP_CLI_DOWNLOAD"), previous_download_setting)
         path.write_text("invalid setting dummy-service-token\n", encoding="utf-8")
         with self.assertRaises(ValueError) as error:
             model_environment(True, {}, self.temp.name)
@@ -581,13 +672,33 @@ class WorkflowTests(unittest.TestCase):
                     return Result()
                 return Result() if "RETURN" not in query else []
         tx = Tx()
-        graph = graph_mapping(str(uuid.uuid4()), {"title": "Case", "activity": "x' MATCH (n) DETACH DELETE n"}, {})
+        injected_name = "Project' MATCH (n) DETACH DELETE n"
+        graph = graph_mapping(
+            str(uuid.uuid4()),
+            {"title": "Case", "activity": "x' MATCH (n) DETACH DELETE n",
+             "project": injected_name},
+            {},
+            {"entities": {
+                "project": [{"name": injected_name, "evidence": injected_name}],
+            }, "unresolved": []},
+        )
         Neo4jRepository._write_transaction(tx, graph)
         self.assertNotIn("DETACH DELETE", " ".join(query for query, _ in tx.calls))
+        self.assertIn(injected_name, json.dumps([params for _, params in tx.calls]))
         tx = Tx()
         Neo4jRepository._search_transaction(tx, "MATCH (n) DELETE n")
         self.assertNotIn("DELETE", tx.calls[0][0])
-        self.assertEqual(tx.calls[0][1]["terms"], ["match", "(n)", "delete"])
+        self.assertEqual(tx.calls[0][1]["terms"], ["match", "delete"])
+        query, params = compile_read_plan({"field": "machine", "terms": ["capper"]})
+        self.assertIn("coalesce(c.machine, '')", query)
+        self.assertNotIn("capper", query)
+        self.assertEqual(params["terms"], ["capper"])
+        self.assertNotIn("CREATE", query)
+        self.assertNotIn("DELETE", query)
+        with self.assertRaisesRegex(ValueError, "unsupported fields"):
+            compile_read_plan({"field": "any", "terms": ["pump"], "cypher": "MATCH (n) DETACH DELETE n"})
+        with self.assertRaisesRegex(ValueError, "unsupported case field"):
+            compile_read_plan({"field": "n.title) DELETE n", "terms": ["pump"]})
 
     def test_missing_graph_constraints_fail_closed(self):
         tx = MagicMock()
@@ -810,6 +921,9 @@ class WorkflowTests(unittest.TestCase):
         request = urllib.request.Request(url + "/api/connection", headers={"Host": "localhost:8000"})
         with urllib.request.urlopen(request) as response:
             self.assertFalse(json.load(response)["configured"])
+        request = urllib.request.Request(url + "/api/model", headers={"Host": "localhost:8000"})
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(json.load(response)["provider"], "manual")
         with self.assertRaises(urllib.error.HTTPError) as check_error:
             post("/api/connection/check", {})
         self.assertEqual(check_error.exception.code, 503)
@@ -864,10 +978,82 @@ class WorkflowTests(unittest.TestCase):
             events = json.load(response)["events"]
             self.assertTrue(any(event["case_id"] == case_id and event["action"] == "upload_completed" for event in events))
         self.assertIn("[case case-1]", post("/api/qa", {"question": "pump"})["answer"])
+        self.assertEqual(self.repo.queries[-1], {"field": "any", "terms": ["pump"], "case_id": None})
         with self.assertRaises(urllib.error.HTTPError) as error:
             post("/api/qa", {"question": "pump"}, origin="https://attacker.example")
         self.assertEqual(error.exception.code, 403)
         error.exception.close()
+
+    def test_model_auth_failure_is_surfaced_without_saving_transcript(self):
+        class FailingAdapter(ManualAdapter):
+            def extract(self, transcript):
+                raise ModelProviderError("Copilot authentication failed. Run `copilot login`.")
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(self.store, self.repo, FailingAdapter()))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}/api/drafts"
+        request = urllib.request.Request(url, data=json.dumps({"transcript": "private transcript"}).encode(),
+            headers={"Host": "localhost:8000", "Content-Type": "application/json", "Origin": "http://localhost:8000"})
+        before = len(self.store.drafts())
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        self.assertEqual(error.exception.code, 503)
+        body = error.exception.read().decode()
+        self.assertIn("copilot login", body)
+        self.assertNotIn("private transcript", body)
+        error.exception.close()
+        self.assertEqual(len(self.store.drafts()), before)
+
+    def test_http_copilot_mapping_requires_confirmation_before_deterministic_upload(self):
+        class MappingAdapter(ManualAdapter):
+            requires_graph_mapping = True
+
+        answers = normalize_answers({
+            "title": "HTTP mapped case", "project": "Project A; Project B",
+            "component": "Chute, Inner Guide",
+        })
+        item = self.store.create("", {"answers": answers, "evidence": {}})
+        item = self.store.update(item["id"], answers, {}, item["revision"])
+        item = self.approve_case(item["id"])
+        server = ThreadingHTTPServer(("127.0.0.1", 0),
+                                     handler_for(self.store, self.repo, MappingAdapter()))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}"
+
+        def post(path, payload):
+            request = urllib.request.Request(
+                url + path, data=json.dumps(payload).encode(),
+                headers={"Host": "localhost:8000", "Content-Type": "application/json",
+                         "Origin": "http://localhost:8000"})
+            with urllib.request.urlopen(request) as response:
+                return json.load(response)
+
+        mapped = post(f"/api/drafts/{item['id']}/map", {"revision": item["revision"]})
+        self.assertFalse(mapped["graph_mapping_approved"])
+        with self.assertRaises(urllib.error.HTTPError) as blocked:
+            post(f"/api/drafts/{item['id']}/save", {"revision": mapped["revision"]})
+        self.assertEqual(blocked.exception.code, 400)
+        blocked.exception.close()
+        self.assertEqual(self.repo.graphs, [])
+
+        confirmed = post(f"/api/drafts/{item['id']}/confirm-mapping",
+                         {"revision": mapped["revision"]})
+        self.assertTrue(confirmed["graph_mapping_approved"])
+        saved = post(f"/api/drafts/{item['id']}/save", {"revision": confirmed["revision"]})
+        self.assertEqual(saved["status"], "saved")
+        self.assertEqual(
+            [node["properties"]["name"] for node in self.repo.graphs[0]["nodes"]
+             if node["label"] == "Project"],
+            ["Project A", "Project B"],
+        )
 
 
 if __name__ == "__main__":

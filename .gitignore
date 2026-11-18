@@ -37,3 +37,14 @@ coverage.xml
 .env_dev
 !.env.example
 data/
+
+# Local credential stores and private key material
+secrets/
+credentials/
+.copilot/
+.netrc
+_netrc
+*.pem
+*.key
+*.p12
+*.pfx

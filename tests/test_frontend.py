@@ -44,6 +44,9 @@ class FrontendTests(unittest.TestCase):
         }
         self.failure_status = None
         self.fail_refresh = False
+        self.mapping_required = False
+        self.runtime_available = True
+        self.mapping_unresolved = False
         self.saved_requests = []
         self.context.route("**/*", self.route)
         self.page.add_init_script("if (!localStorage.getItem('lfeDraft')) localStorage.setItem('lfeDraft', 'case-a')")
@@ -66,6 +69,11 @@ class FrontendTests(unittest.TestCase):
                 for i, (label, fields) in enumerate(QUESTIONS, 1)]}
         elif path == "/api/connection":
             result = {"configured": True, "mock_uploads_allowed": False, "message": "Test configuration"}
+        elif path == "/api/model":
+            result = {"provider": "copilot-local-cli" if self.mapping_required else "manual",
+                      "configured": True, "cli_available": True,
+                      "runtime_available": self.runtime_available,
+                      "message": "The Copilot SDK runtime 1.0.113 is not cached locally. The app will not download it automatically."}
         elif path == "/api/samples":
             result = {"samples": []}
         elif path in ("/api/drafts", "/api/pending-upload", "/api/pending", "/api/history"):
@@ -74,6 +82,8 @@ class FrontendTests(unittest.TestCase):
                         "/api/history": ("approved", "saved", "upload_failed")}[path]
             result = {"cases": [dict(item, title=item["answers"]["title"]) for item in self.cases.values()
                                 if item["status"] in statuses]}
+            if path == "/api/pending-upload":
+                result["mapping_required"] = self.mapping_required
         elif path.startswith("/api/drafts/"):
             parts = path.split("/")
             item = self.cases[parts[3]]
@@ -81,6 +91,12 @@ class FrontendTests(unittest.TestCase):
                 if self.fail_refresh:
                     return route.fulfill(status=503, json={"error": "Refresh unavailable"})
                 result = item
+            elif parts[4] == "graph-preview":
+                proposal = item.get("graph_mapping_proposal")
+                result = {"revision": item["revision"], "case_name": item["answers"]["title"],
+                          "source": "copilot_proposal" if proposal else "current_mapper",
+                          "entries": [], "unresolved": proposal["unresolved"] if proposal else [],
+                          "mapping_approved": item.get("graph_mapping_approved", False)}
             elif parts[4] == "save":
                 self.saved_requests.append(route.request.post_data_json)
                 item["status"] = self.failure_status or "saved"
@@ -93,11 +109,40 @@ class FrontendTests(unittest.TestCase):
                 item.update(answers=payload["answers"], evidence=payload["evidence"], status="draft",
                             revision=item["revision"] + 1)
                 result = item
+            elif parts[4] == "map":
+                proposal = {"entities": {field: [] for field in
+                             ("project", "product", "line", "machine", "component", "material",
+                              "supplier", "action", "attachment_description")},
+                            "unresolved": []}
+                if item["answers"].get("project"):
+                    if self.mapping_unresolved:
+                        proposal["unresolved"] = [{
+                            "field": "project", "excerpt": item["answers"]["project"],
+                            "reason": "Ambiguous project name",
+                        }]
+                    else:
+                        proposal["entities"]["project"] = [{
+                            "name": item["answers"]["project"],
+                            "evidence": item["answers"]["project"],
+                        }]
+                item.update(graph_mapping_proposal=proposal, graph_mapping_approved=False,
+                            revision=item["revision"] + 1)
+                result = item
+            elif parts[4] == "confirm-mapping":
+                item.update(graph_mapping_approved=True, revision=item["revision"] + 1)
+                result = item
             else:
                 raise AssertionError(f"Unexpected API action: {path}")
         else:
             raise AssertionError(f"Unexpected request: {path}")
         route.fulfill(json=result)
+
+    def test_local_model_status_exposes_missing_sdk_runtime(self):
+        self.mapping_required = True
+        self.runtime_available = False
+        self.page.reload()
+        self.page.wait_for_function("document.getElementById('model-status').textContent.includes('Copilot SDK unavailable')")
+        self.assertIn("will not download", self.page.locator("#model-status").inner_text())
 
     def select_case(self, case_id):
         self.page.evaluate("""item => {
@@ -291,3 +336,42 @@ class FrontendTests(unittest.TestCase):
         self.page.wait_for_function("!mutationPending && draft.id === 'case-a'")
         self.assertEqual(self.page.locator("#field-title").input_value(), "Case A")
         self.assertEqual(self.page.evaluate("localStorage.getItem('lfeDraft')"), "case-a")
+
+    def test_copilot_mapping_must_be_reviewed_and_confirmed_before_upload(self):
+        self.mapping_required = True
+        self.cases["case-a"].update(status="approved")
+        self.cases["case-a"]["answers"]["project"] = "Project A"
+        self.page.locator("#tab-button-upload").click()
+        self.page.wait_for_selector("#upload-list .mapping-generate")
+        card = self.page.locator("#upload-list .upload-card").filter(has_text="Case A")
+        self.assertTrue(card.get_by_role("button", name="Generate Copilot mapping").is_visible())
+        self.assertTrue(card.get_by_role("button", name="Upload to Neo4j").is_disabled())
+
+        card.get_by_role("button", name="Generate Copilot mapping").click()
+        self.page.wait_for_function("!mutationPending")
+        self.assertTrue(card.get_by_role("button", name="Confirm graph mapping").is_visible())
+        self.assertTrue(card.get_by_role("button", name="Upload to Neo4j").is_disabled())
+
+        card.get_by_role("button", name="Confirm graph mapping").click()
+        self.page.wait_for_function("!mutationPending")
+        card = self.page.locator("#upload-list .upload-card").filter(has_text="Case A")
+        self.assertTrue(card.get_by_role("button", name="Upload to Neo4j").is_enabled())
+        card.get_by_role("button", name="Upload to Neo4j").click()
+        self.page.wait_for_function("!mutationPending")
+        self.assertEqual(self.saved_requests[-1]["revision"], 3)
+
+    def test_unresolved_copilot_mapping_offers_questionnaire_correction(self):
+        self.mapping_required = True
+        self.mapping_unresolved = True
+        self.cases["case-a"].update(status="approved")
+        self.cases["case-a"]["answers"]["project"] = "Project A or B"
+        self.page.locator("#tab-button-upload").click()
+        card = self.page.locator("#upload-list .upload-card").filter(has_text="Case A")
+        card.get_by_role("button", name="Generate Copilot mapping").click()
+        self.page.wait_for_function("!mutationPending")
+        self.assertTrue(card.get_by_role("button", name="Open review to correct").is_visible())
+        self.assertFalse(card.get_by_role("button", name="Confirm graph mapping").is_visible())
+        self.assertTrue(card.get_by_role("button", name="Upload to Neo4j").is_disabled())
+        card.get_by_role("button", name="Open review to correct").click()
+        self.page.wait_for_function("!mutationPending && activeTab === 'workspace'")
+        self.assertEqual(self.page.locator("#field-project").input_value(), "Project A or B")
