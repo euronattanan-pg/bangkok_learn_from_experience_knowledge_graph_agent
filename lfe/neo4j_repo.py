@@ -4,6 +4,8 @@ import hashlib
 import json
 from importlib.util import find_spec
 
+from .query_plan import compile_read_plan, question_terms
+
 
 class ConfigurationError(RuntimeError):
     pass
@@ -229,29 +231,27 @@ class Neo4jRepository:
                 tx.run(query, **params).consume()
 
     def search(self, question):
-        if not isinstance(question, str) or not question.strip():
-            raise ValueError("Enter a question.")
-        # A fixed read-only query: no generated or user-provided Cypher is executed.
+        return self.search_plan({"field": "any", "terms": question_terms(question)})
+
+    def search_plan(self, plan):
+        query, params = compile_read_plan(plan)
         try:
             with self.driver() as driver:
                 with driver.session(database=self.database, default_access_mode="READ") as session:
-                    return session.execute_read(self._search_transaction, question.strip())
+                    return session.execute_read(self._read_plan_transaction, query, params)
+        except ValueError:
+            raise
         except ConfigurationError:
             raise
         except Exception as exc:
             raise DatabaseOperationError("Neo4j search failed. Check the connection, database name, and read permissions.") from exc
 
     @staticmethod
-    def _search_transaction(tx, question):
-        result = tx.run(
-            "MATCH (c:LFECase) WHERE any(term IN $terms WHERE "
-            "toLower(coalesce(c.title,'') + ' ' + coalesce(c.activity,'') + ' ' + "
-            "coalesce(c.cause,'') + ' ' + coalesce(c.action,'') + ' ' + "
-            "coalesce(c.defect_description,'') + ' ' + coalesce(c.project,'') + ' ' + "
-            "coalesce(c.product,'') + ' ' + coalesce(c.material,'') + ' ' + "
-            "coalesce(c.supplier,'') + ' ' + coalesce(c.machine,'') + ' ' + "
-            "coalesce(c.line,'')) CONTAINS term) "
-            "RETURN c.id AS id, c.title AS title, c.activity AS activity LIMIT 20",
-            terms=[word.lower() for word in question.split() if len(word) > 1][:20],
-        )
+    def _read_plan_transaction(tx, query, params):
+        result = tx.run(query, **params)
         return [dict(record) for record in result if record["id"]]
+
+    @staticmethod
+    def _search_transaction(tx, question):
+        query, params = compile_read_plan({"field": "any", "terms": question_terms(question)})
+        return Neo4jRepository._read_plan_transaction(tx, query, params)

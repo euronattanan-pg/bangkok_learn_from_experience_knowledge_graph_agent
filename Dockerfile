@@ -7,5 +7,6 @@ COPY static ./static
 RUN useradd --create-home app && mkdir /data && chown app:app /data
 USER app
 ENV LFE_DATA_DIR=/data
+ENV LFE_DEPLOYMENT_MODE=vm
 EXPOSE 8000
 CMD ["python", "-m", "lfe.server"]

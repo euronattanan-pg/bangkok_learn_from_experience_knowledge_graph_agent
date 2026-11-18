@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .config import model_environment, neo4j_environment
-from .model import configured_adapter
+from .model import LocalCopilotAdapter, ModelProviderError, configured_adapter
 from .neo4j_repo import ConfigurationError, DatabaseOperationError, Neo4jRepository
 from .samples import samples
 from .schema import FIELDS, QUESTIONS
@@ -56,6 +56,8 @@ def handler_for(store, repository, adapter):
                 status = repository.status()
                 status["mock_uploads_allowed"] = store.allow_mock_uploads
                 return self.respond(200, status)
+            if path == "/api/model":
+                return self.respond(200, adapter.status())
             if path == "/api/pending":
                 return self.respond(200, {"cases": store.pending()})
             if path == "/api/drafts":
@@ -63,7 +65,8 @@ def handler_for(store, repository, adapter):
             if path == "/api/history":
                 return self.respond(200, {"cases": store.history()})
             if path == "/api/pending-upload":
-                return self.respond(200, {"cases": store.pending_upload()})
+                return self.respond(200, {"cases": store.pending_upload(),
+                                          "mapping_required": adapter.requires_graph_mapping})
             if path == "/api/audit":
                 return self.respond(200, {"events": store.audit()})
             if path.startswith("/api/drafts/") and path.endswith("/graph-preview"):
@@ -106,7 +109,7 @@ def handler_for(store, repository, adapter):
                     result = store.create("", extraction, is_sample=True)
                 elif len(path) == 4 and path[:2] == ["api", "drafts"]:
                     case_id, action = path[2:]
-                    if action not in ("update", "submit", "approve", "save"):
+                    if action not in ("update", "submit", "approve", "save", "map", "confirm-mapping"):
                         return self.respond(404, {"error": "Not found."})
                     try:
                         if action == "update":
@@ -115,15 +118,28 @@ def handler_for(store, repository, adapter):
                             result = store.submit(case_id, payload.get("revision"))
                         elif action == "approve":
                             result = store.approve(case_id, payload.get("revision"))
+                        elif action == "map":
+                            source = store.graph_mapping_source(case_id, payload.get("revision"))
+                            try:
+                                proposal = adapter.map_graph(source["answers"])
+                            except ModelProviderError:
+                                store.record_mapping_failure(case_id, source["revision"])
+                                raise
+                            result = store.propose_graph_mapping(case_id, source["revision"], proposal)
+                        elif action == "confirm-mapping":
+                            result = store.confirm_graph_mapping(case_id, payload.get("revision"))
                         else:
-                            result = store.save(case_id, payload.get("revision"), repository)
+                            result = store.save(case_id, payload.get("revision"), repository,
+                                                require_mapping=adapter.requires_graph_mapping)
                     except ValueError:
                         store.record_rejection(case_id, action)
                         raise
                 elif path == ["api", "qa"]:
                     question = payload.get("question")
-                    cases = repository.search(question)
-                    result = {"answer": adapter.answer(question, cases), "cases": cases}
+                    plan = adapter.plan(question)
+                    cases = repository.search_plan(plan)
+                    answer = adapter.answer(question, cases) if cases else "No matching cases found."
+                    result = {"answer": answer, "cases": cases}
                 elif path == ["api", "connection", "check"]:
                     result = repository.check_connection()
                 else:
@@ -131,7 +147,7 @@ def handler_for(store, repository, adapter):
                 return self.respond(200, result)
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 return self.respond(400, {"error": str(exc)})
-            except (ConfigurationError, DatabaseOperationError) as exc:
+            except (ConfigurationError, DatabaseOperationError, ModelProviderError) as exc:
                 return self.respond(503, {"error": str(exc)})
             except Exception:
                 # Driver errors can contain connection details; never expose or log them.
@@ -144,12 +160,20 @@ def main():
     parser = argparse.ArgumentParser(description="Run the local LFE application.")
     parser.add_argument("--env-dev", action="store_true", help="Load Neo4j settings from .env_dev in the current directory.")
     parser.add_argument("--env", action="store_true", help="Load server-only model settings from .env in the current directory.")
+    parser.add_argument("--allow-local-copilot", action="store_true",
+                        help="Enable signed-in local Copilot CLI inference for this single-user, loopback-only process.")
     parser.add_argument("--allow-mock-upload", action="store_true",
                         help="Allow approved mock cases to be uploaded to the configured dedicated test database only.")
     args = parser.parse_args()
     try:
         env = neo4j_environment(use_env_dev=args.env_dev)
-        adapter = configured_adapter(model_environment(use_env=args.env))
+        model_config = model_environment(use_env=args.env)
+        listen_host = os.environ.get("LFE_LISTEN_HOST", "127.0.0.1")
+        adapter = configured_adapter(
+            model_config, allow_local_copilot=args.allow_local_copilot,
+            listen_host=listen_host, deployment_mode=model_config.get("LFE_DEPLOYMENT_MODE"))
+        if isinstance(adapter, LocalCopilotAdapter):
+            os.environ["COPILOT_TELEMETRY_DISABLED"] = "true"
     except (ValueError, RuntimeError) as exc:
         parser.exit(2, f"{exc}\n")
     data_dir = Path(os.environ.get("LFE_DATA_DIR", "data"))
@@ -157,7 +181,7 @@ def main():
     try:
         with WorkspaceLock(database_path) as owner:
             store = Store(database_path, allow_mock_uploads=args.allow_mock_upload, owner=owner)
-            with ThreadingHTTPServer((os.environ.get("LFE_LISTEN_HOST", "127.0.0.1"), 8000),
+            with ThreadingHTTPServer((listen_host, 8000),
                                      handler_for(store, Neo4jRepository(env), adapter)) as server:
                 server.serve_forever()
     except WorkspaceOwnershipError as exc:

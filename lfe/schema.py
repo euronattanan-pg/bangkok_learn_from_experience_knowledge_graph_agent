@@ -59,6 +59,17 @@ QUESTIONS = (
     ("How effectiveness verified", ("verification",)),
     ("Attachment", ("attachment", "attachment_description")),
 )
+GRAPH_ENTITY_FIELDS = {
+    "project": "Project",
+    "product": "Product",
+    "line": "ProductionLine",
+    "machine": "Machine",
+    "component": "MachineComponent",
+    "material": "Material",
+    "supplier": "Supplier",
+    "action": "Action",
+    "attachment_description": "Evidence",
+}
 
 
 def normalize_answers(answers):
@@ -96,6 +107,73 @@ def normalize_evidence(evidence):
         if value.strip():
             result[key] = value.strip()
     return result
+
+
+def normalize_graph_entity_mapping(answers, mapping):
+    """Validate model-proposed entity names against exact questionnaire source text."""
+    answers = normalize_answers(answers)
+    if not isinstance(mapping, dict) or set(mapping) != {"entities", "unresolved"}:
+        raise ValueError("Graph mapping must contain entities and unresolved items only.")
+    entities = mapping["entities"]
+    if not isinstance(entities, dict) or set(entities) - set(GRAPH_ENTITY_FIELDS):
+        raise ValueError("Graph mapping contains an unsupported questionnaire field.")
+    normalized_entities = {}
+    for field in GRAPH_ENTITY_FIELDS:
+        raw_items = entities.get(field, [])
+        if not isinstance(raw_items, list) or len(raw_items) > 100:
+            raise ValueError(f"Graph mapping for {field} must contain at most 100 entities.")
+        source = answers[field]
+        normalized_entities[field] = []
+        seen = set()
+        for item in raw_items:
+            if not isinstance(item, dict) or set(item) != {"name", "evidence"}:
+                raise ValueError(f"Graph mapping for {field} has an invalid entity shape.")
+            name, excerpt = item["name"], item["evidence"]
+            if (not isinstance(name, str) or not name.strip() or len(name) > 200
+                    or not isinstance(excerpt, str) or not excerpt.strip() or len(excerpt) > 500):
+                raise ValueError(f"Graph mapping for {field} has an invalid entity or evidence.")
+            name, excerpt = name.strip(), excerpt.strip()
+            if not source or excerpt not in source or name not in excerpt:
+                raise ValueError(f"Graph mapping for {field} is not grounded in its questionnaire answer.")
+            key = normalized_name(name)
+            if key in seen:
+                raise ValueError(f"Graph mapping for {field} contains a duplicate entity.")
+            seen.add(key)
+            normalized_entities[field].append({"name": name, "evidence": excerpt})
+
+    unresolved = mapping["unresolved"]
+    if not isinstance(unresolved, list) or len(unresolved) > 50:
+        raise ValueError("Graph mapping unresolved items must be a list of at most 50 entries.")
+    normalized_unresolved = []
+    for item in unresolved:
+        if not isinstance(item, dict) or set(item) != {"field", "excerpt", "reason"}:
+            raise ValueError("Graph mapping contains an invalid unresolved item.")
+        field, excerpt, reason = item["field"], item["excerpt"], item["reason"]
+        if not isinstance(field, str) or field not in GRAPH_ENTITY_FIELDS:
+            raise ValueError("Graph mapping contains an unresolved unsupported field.")
+        source = answers[field]
+        if (not source or not isinstance(excerpt, str) or not excerpt.strip()
+                or len(excerpt) > 500 or excerpt.strip() not in source):
+            raise ValueError(f"Unresolved graph mapping for {field} is not grounded in its questionnaire answer.")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 300:
+            raise ValueError(f"Unresolved graph mapping for {field} needs a brief reason.")
+        normalized_unresolved.append({"field": field, "excerpt": excerpt.strip(),
+                                      "reason": reason.strip()})
+
+    for field in GRAPH_ENTITY_FIELDS:
+        source = answers[field]
+        if not source:
+            continue
+        evidence = [item["evidence"] for item in normalized_entities[field]]
+        evidence.extend(item["excerpt"] for item in normalized_unresolved if item["field"] == field)
+        segments = split_items(
+            source, commas=field in ("component", "attachment_description"),
+            conjunction=field == "component",
+        )
+        if not segments or any(not any(segment in excerpt for excerpt in evidence)
+                               for segment in segments):
+            raise ValueError(f"Graph mapping omitted part of {field}; map each listed value or mark it unresolved.")
+    return {"entities": normalized_entities, "unresolved": normalized_unresolved}
 
 
 def normalized_name(value):
@@ -170,7 +248,7 @@ def split_items(value, *, commas=False, conjunction=False, deduplicate=False):
     return items
 
 
-def graph_mapping(case_id, answers, evidence):
+def graph_mapping(case_id, answers, evidence, entity_mapping=None):
     uuid.UUID(case_id)
     a = normalize_answers(answers)
     ev = normalize_evidence(evidence)
@@ -181,8 +259,13 @@ def graph_mapping(case_id, answers, evidence):
     case["title_key"] = identity_key(a["title"])
     case["display_name"] = display_name(a["title"])
     case["graph_schema_version"] = 2
-    lists = {field: split_items(a[field], commas=field == "component",
-                                conjunction=field == "component", deduplicate=True)
+    mapped_entities = {
+        field: [item["name"] for item in items]
+        for field, items in entity_mapping.get("entities", {}).items()
+    } if entity_mapping else {}
+    lists = {field: (mapped_entities[field] if field in mapped_entities else
+                     split_items(a[field], commas=field == "component",
+                                 conjunction=field == "component", deduplicate=True))
              for field in ("project", "product", "line", "machine", "component", "material", "supplier")}
     nodes = []
     for field, label, relation in (
@@ -224,7 +307,7 @@ def graph_mapping(case_id, answers, evidence):
         props = {key: value for key, value in props.items() if value is not None}
         if props:
             nodes.append({"label": label, "relation": relation, "properties": props})
-    actions = split_items(a["action"])
+    actions = (mapped_entities["action"] if "action" in mapped_entities else split_items(a["action"]))
     for action in actions:
         props = {"description": action}
         if len(actions) == 1 and a["action_effective"] is not None:
@@ -233,7 +316,8 @@ def graph_mapping(case_id, answers, evidence):
     if not actions and a["action_effective"] is not None:
         nodes.append({"label": "Action", "relation": "HAS_ACTION",
                       "properties": {"effective": a["action_effective"]}})
-    attachments = split_items(a["attachment_description"], commas=True)
+    attachments = (mapped_entities["attachment_description"] if "attachment_description" in mapped_entities
+                   else split_items(a["attachment_description"], commas=True))
     if a["attachment"] and len(attachments) != 1:
         nodes.append({"label": "Evidence", "relation": "HAS_EVIDENCE", "properties": {"attachment": a["attachment"]}})
     for attachment in attachments:

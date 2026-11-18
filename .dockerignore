@@ -5,3 +5,12 @@ __pycache__
 *.pyc
 .venv
 tests
+secrets
+credentials
+.copilot
+.netrc
+_netrc
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx

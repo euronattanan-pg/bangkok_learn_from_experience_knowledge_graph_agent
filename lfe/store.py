@@ -5,7 +5,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .neo4j_repo import DuplicateTitleError, GraphSchemaError
-from .schema import graph_mapping, normalize_answers, normalize_evidence, normalized_name, preview_graph
+from .schema import (graph_mapping, normalize_answers, normalize_evidence,
+                     normalize_graph_entity_mapping, normalized_name, preview_graph)
 
 
 class Store:
@@ -24,6 +25,10 @@ class Store:
                 db.execute("ALTER TABLE drafts ADD COLUMN graph_schema_version INTEGER")
             if "upload_graph" not in columns:
                 db.execute("ALTER TABLE drafts ADD COLUMN upload_graph TEXT")
+            if "graph_mapping_proposal" not in columns:
+                db.execute("ALTER TABLE drafts ADD COLUMN graph_mapping_proposal TEXT")
+            if "graph_mapping_approved" not in columns:
+                db.execute("ALTER TABLE drafts ADD COLUMN graph_mapping_approved INTEGER NOT NULL DEFAULT 0")
             existing_audit = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit_events'").fetchone()
             db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, case_id TEXT NOT NULL,
@@ -69,6 +74,10 @@ class Store:
         item = dict(row)
         item["answers"] = normalize_answers(json.loads(item["answers"]))
         item["evidence"] = json.loads(item["evidence"])
+        item["graph_mapping_proposal"] = (
+            json.loads(item["graph_mapping_proposal"]) if item.get("graph_mapping_proposal") else None
+        )
+        item["graph_mapping_approved"] = bool(item.get("graph_mapping_approved", 0))
         item["is_sample"] = bool(item["is_sample"])
         item.pop("upload_graph", None)
         return item
@@ -118,9 +127,60 @@ class Store:
             snapshot = row["upload_graph"] if frozen else None
             if frozen and not snapshot:
                 raise GraphSchemaError("This older upload has no frozen preview. Reconcile its graph mapping before retrying.")
-            graph = json.loads(snapshot) if snapshot else graph_mapping(case_id, item["answers"], item["evidence"])
+            proposal = item["graph_mapping_proposal"]
+            graph = (json.loads(snapshot) if snapshot else
+                     graph_mapping(case_id, item["answers"], item["evidence"], proposal))
         return {**preview_graph(graph), "revision": item["revision"],
-                "source": "frozen_upload" if snapshot else "current_mapper"}
+                "source": "frozen_upload" if snapshot else
+                "copilot_proposal" if proposal else "current_mapper",
+                "unresolved": proposal["unresolved"] if proposal else [],
+                "mapping_approved": item["graph_mapping_approved"]}
+
+    def graph_mapping_source(self, case_id, revision):
+        with self.connect() as db:
+            db.execute("BEGIN")
+            item = self._current(db, case_id, revision)
+            if item["status"] != "approved":
+                raise ValueError("Only an approved questionnaire can be mapped for upload.")
+            return {"answers": item["answers"], "revision": item["revision"]}
+
+    def propose_graph_mapping(self, case_id, revision, proposal):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            item = self._current(db, case_id, revision)
+            if item["status"] != "approved":
+                raise ValueError("Only an approved questionnaire can be mapped for upload.")
+            proposal = normalize_graph_entity_mapping(item["answers"], proposal)
+            graph_mapping(case_id, item["answers"], item["evidence"], proposal)
+            db.execute("""UPDATE drafts SET graph_mapping_proposal=?, graph_mapping_approved=0,
+                          revision=revision+1
+                          WHERE id=? AND revision=?""",
+                       (json.dumps(proposal, ensure_ascii=False), case_id, revision))
+            outcome = "needs_review" if proposal["unresolved"] else "ready_for_review"
+            self._audit(db, case_id, "graph_mapping_proposed", outcome, "approved", "approved")
+        return self.get(case_id)
+
+    def confirm_graph_mapping(self, case_id, revision):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            item = self._current(db, case_id, revision)
+            proposal = item["graph_mapping_proposal"]
+            if item["status"] != "approved":
+                raise ValueError("Only an approved questionnaire can have its graph mapping confirmed.")
+            if not proposal:
+                raise ValueError("Generate a graph mapping proposal before confirming it.")
+            if proposal["unresolved"]:
+                raise ValueError("Resolve the flagged graph entities in the questionnaire, then resubmit and reapprove it.")
+            graph_mapping(case_id, item["answers"], item["evidence"], proposal)
+            db.execute("""UPDATE drafts SET graph_mapping_approved=1, revision=revision+1
+                          WHERE id=? AND revision=?""", (case_id, revision))
+            self._audit(db, case_id, "graph_mapping_confirmed", "succeeded", "approved", "approved")
+        return self.get(case_id)
+
+    def record_mapping_failure(self, case_id, revision):
+        with self.connect() as db:
+            item = self._current(db, case_id, revision)
+            self._audit(db, case_id, "graph_mapping_failed", "failed", item["status"], item["status"])
 
     def record_rejection(self, case_id, action):
         with self.connect() as db:
@@ -137,8 +197,9 @@ class Store:
             if item["status"] not in ("draft", "pending", "approved"):
                 raise ValueError("This case cannot be edited after an upload attempt.")
             self._check_title(db, answers["title"], case_id)
-            db.execute("UPDATE drafts SET answers=?, evidence=?, status='draft', revision=revision+1 WHERE id=?",
-                       (json.dumps(answers), json.dumps(evidence), case_id))
+            db.execute("""UPDATE drafts SET answers=?, evidence=?, status='draft',
+                          graph_mapping_proposal=NULL, graph_mapping_approved=0, revision=revision+1
+                          WHERE id=?""", (json.dumps(answers), json.dumps(evidence), case_id))
             action = "approval_invalidated" if item["status"] == "approved" else "review_updated"
             self._audit(db, case_id, action, "succeeded", item["status"], "draft")
         return self.get(case_id)
@@ -167,7 +228,7 @@ class Store:
             self._audit(db, case_id, "approved", "succeeded", "pending", "approved")
         return self.get(case_id)
 
-    def save(self, case_id, revision, repository):
+    def save(self, case_id, revision, repository, require_mapping=False):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             item = self._current(db, case_id, revision)
@@ -175,6 +236,9 @@ class Store:
                 raise ValueError("Mock uploads are disabled. Enable them only for a dedicated test database.")
             if item["status"] not in ("approved", "upload_failed"):
                 raise ValueError("Approve this case before writing it to Neo4j.")
+            if (require_mapping and item["status"] == "approved"
+                    and not item["graph_mapping_approved"]):
+                raise ValueError("Generate and confirm the Copilot graph mapping before uploading this approved case.")
             self._check_title(db, item["answers"]["title"], case_id)
             snapshot = db.execute("SELECT upload_graph FROM drafts WHERE id=?", (case_id,)).fetchone()["upload_graph"]
             if item["status"] == "upload_failed" and not snapshot:
@@ -182,7 +246,8 @@ class Store:
             if item["status"] == "upload_failed":
                 graph = json.loads(snapshot)
             else:
-                graph = graph_mapping(case_id, item["answers"], item["evidence"])
+                proposal = item["graph_mapping_proposal"] if item["graph_mapping_approved"] else None
+                graph = graph_mapping(case_id, item["answers"], item["evidence"], proposal)
                 if item["is_sample"]:
                     graph["case"]["is_mock"] = True
             db.execute("UPDATE drafts SET status='writing', upload_graph=?, revision=revision+1 WHERE id=?",
@@ -230,7 +295,8 @@ class Store:
         with self.connect() as db:
             rows = db.execute("SELECT * FROM drafts WHERE status IN ('approved','writing','upload_failed') ORDER BY rowid DESC").fetchall()
             items = [self.decode(row) for row in rows]
-        return [{key: item[key] for key in ("id", "status", "revision", "is_sample", "answers", "evidence")}
+        return [{key: item[key] for key in ("id", "status", "revision", "is_sample", "answers", "evidence",
+                                            "graph_mapping_proposal", "graph_mapping_approved")}
                 for item in items]
 
     def _list_cases(self, condition):
